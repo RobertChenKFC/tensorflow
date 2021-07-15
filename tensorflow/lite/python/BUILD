@@ -190,6 +190,22 @@ py_library(
     ],
 )
 
+# EDIT
+py_library(
+    name = "representative_dataset",
+    srcs = ["representative_dataset.py"]
+)
+
+# EDIT
+py_binary(
+    name = "tflite_convert_with_mypass",
+    srcs = ["tflite_convert_with_mypass.py"],
+    deps = [
+        ":lite",
+        ":representative_dataset"
+    ]
+)
+
 py_test(
     name = "lite_test",
     srcs = ["lite_test.py"],

@@ -29,12 +29,273 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/tensorflow/transforms/passes.h"
 #include "tensorflow/compiler/mlir/tensorflow/transforms/tf_saved_model_passes.h"
 #include "tensorflow/compiler/mlir/tensorflow/translate/tf_mlir_translate.h"
+// EDIT
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "tensorflow/compiler/mlir/tensorflow/ir/tf_ops.h"
+#include "tensorflow/compiler/mlir/lite/ir/tfl_ops.h"
+#include "mlir/IR/Verifier.h"
 
 namespace mlir {
 /// Create a pass to convert from the TFExecutor to the TF control dialect.
 std::unique_ptr<OperationPass<FuncOp>>
 CreateTFExecutorToControlDialectConversion();
 }  // namespace mlir
+
+// EDIT
+namespace MyPass {
+struct ReplaceAbsOp : public mlir::OpRewritePattern<mlir::TFL::AbsOp> {
+  ReplaceAbsOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::AbsOp>(ctx, /*benefit=*/1) {}
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::TFL::AbsOp op, mlir::PatternRewriter &rewriter) const override {
+    llvm::dbgs() << "INFO: AbsOp is called!\n";
+
+    auto x = op.getOperand();
+    auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+    auto zeroType = mlir::RankedTensorType::get(xType.getShape(),
+                                                xType.getElementType());
+    auto zeroAttr = mlir::SplatElementsAttr::get(zeroType, 0);
+    auto zero = rewriter.create<mlir::TFL::ConstOp>(op.getLoc(), zeroType,
+                                                    zeroAttr);
+    auto negX = rewriter.create<mlir::TFL::SubOp>(
+        op.getLoc(), zero, x, rewriter.getStringAttr("NONE"));
+    auto max = rewriter.replaceOpWithNewOp<mlir::TFL::MaximumOp>(op, x, negX);
+
+    return mlir::success();
+  }
+};
+
+struct ReplaceUnpackOp : public mlir::OpRewritePattern<mlir::TFL::UnpackOp> {
+  ReplaceUnpackOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::UnpackOp>(ctx, /*benefit=*/1) {}
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::TFL::UnpackOp op, mlir::PatternRewriter &rewriter) const override {
+    llvm::dbgs() << "INFO: UnpackOp is called!\n";
+
+    auto x = op.getOperand();
+    auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+
+    auto numAttr = op->getAttr("num").dyn_cast<mlir::IntegerAttr>();
+    auto num = numAttr.getInt();
+    auto axisAttr = op->getAttr("axis").dyn_cast<mlir::IntegerAttr>();
+    auto axis = axisAttr.getInt();
+
+    auto size = static_cast<int64_t>(xType.getShape().size());
+    auto stridedSliceInputShape = llvm::ArrayRef<int64_t>(size);
+    auto stridedSliceInputType = mlir::RankedTensorType::get(
+        stridedSliceInputShape, rewriter.getI32Type());
+    auto strideAttr = mlir::SplatElementsAttr::get(stridedSliceInputType, 1);
+    auto strideConst = rewriter.create<mlir::TFL::ConstOp>(
+        op.getLoc(), strideAttr.getType(), strideAttr);
+
+    auto slicedXShape = xType.getShape().vec();
+    slicedXShape.erase(slicedXShape.begin() + axis);
+    auto slicedXType =
+        mlir::RankedTensorType::get(slicedXShape, xType.getElementType());
+
+    auto zerosMask = rewriter.getI32IntegerAttr(0);
+    auto shrinkAxisMask = rewriter.getI32IntegerAttr(1 << axis);
+
+    std::vector<mlir::Value> slicedXs;
+    slicedXs.reserve(num);
+    for (long i = 0; i < num; ++i) {
+      auto beginVals = std::vector<int32_t>(xType.getShape().size(), 0);
+      beginVals[axis] = i;
+      auto beginAttr = rewriter.getI32TensorAttr(beginVals);
+      auto beginConst = rewriter.create<mlir::TFL::ConstOp>(
+          op.getLoc(), beginAttr.getType(), beginAttr);
+
+      // TODO: check if the vector can be reused
+      auto endVals = std::vector<int32_t>(xType.getShape().size(), 0);
+      endVals[axis] = i + 1;
+      auto endAttr = rewriter.getI32TensorAttr(endVals);
+      auto endConst = rewriter.create<mlir::TFL::ConstOp>(
+          op.getLoc(), endAttr.getType(), endAttr);
+
+      auto slicedX = rewriter.create<mlir::TFL::StridedSliceOp>(
+          op.getLoc(), slicedXType, x, beginConst, endConst, strideConst,
+          zerosMask, zerosMask, zerosMask, zerosMask, shrinkAxisMask);
+      slicedXs.push_back(slicedX);
+    }
+
+    rewriter.replaceOp(op, slicedXs);
+
+    return mlir::success();
+  }
+};
+
+mlir::Value PolynomialValue(
+    mlir::PatternRewriter &rewriter, const mlir::Location &loc,
+    const mlir::Value &x, float coeffs[], int degree) {
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+
+  auto highestTermCoeffAttr = mlir::SplatElementsAttr::get(
+      xType, coeffs[degree]);
+  auto highestTermCoeff = rewriter.create<mlir::TFL::ConstOp>(
+      loc, highestTermCoeffAttr.getType(), highestTermCoeffAttr);
+
+  auto sum = highestTermCoeff.getResult();
+  auto noActivationAttr = rewriter.getStringAttr("NONE");
+  for (int i = degree - 1; i >= 0; --i) {
+    sum = rewriter.create<mlir::TFL::MulOp>(loc, sum, x, noActivationAttr);
+    auto coeffAttr = mlir::SplatElementsAttr::get(xType, coeffs[i]);
+    auto coeff = rewriter.create<mlir::TFL::ConstOp>(
+        loc, coeffAttr.getType(), coeffAttr);
+    sum = rewriter.create<mlir::TFL::AddOp>(
+        loc, sum, coeff, noActivationAttr);
+  }
+
+  return sum;
+}
+
+struct ReplaceExpOp : public mlir::OpRewritePattern<mlir::TFL::ExpOp> {
+  ReplaceExpOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::ExpOp>(ctx, /*benefit=*/1) {}
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::TFL::ExpOp op, mlir::PatternRewriter &rewriter) const override {
+    llvm::dbgs() << "INFO: ExpOp is called!\n";
+
+    auto x = op.getOperand();
+
+    // least square in range [-3, 3]
+    float coeffs[] = { 0.59803783, 0.7892836, 0.91375127, 0.26916787 };
+    // least square relative in range [-3, 3]
+    // float coeffs[] = { 0.90509352, 1.31294584, 0.78952683, 0.15414826 };
+    // minimax approximation in range [-3, 3]
+    // float coeffs[] = { 0.3986013, 0.52297465, 0.99602537, 0.31292411 };
+    auto sum = PolynomialValue(rewriter, op.getLoc(), x, coeffs, 3);
+    rewriter.replaceOp(op, {sum});
+
+    return mlir::success();
+  }
+};
+
+struct ReplaceLogOp : public mlir::OpRewritePattern<mlir::TFL::LogOp> {
+  ReplaceLogOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::LogOp>(ctx, /*benefit=*/1) {}
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::TFL::LogOp op, mlir::PatternRewriter &rewriter) const override {
+    llvm::dbgs() << "INFO: LogOp is called!\n";
+
+    auto x = op.getOperand();
+    auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+
+    // least square in range [exp(-3)+1, exp(3)+1]
+    float coeffs[] = { -0.10349343, 0.44997741, -0.02630398, 0.00058021 };
+    // least square relative in range [exp(-3)+1, exp(3)+1]
+    // float coeffs[] = { -0.3548069 , 0.54611009, -0.03581849, 0.00085092 };
+    // minimax approximation in range [exp(-3)+1, exp(3)+1]
+    // float coeffs[] = { -0.39904023, 0.57170487, -0.03831855, 0.00091105 };
+    auto sum = PolynomialValue(rewriter, op.getLoc(), x, coeffs, 3);
+    rewriter.replaceOp(op, {sum});
+
+    return mlir::success();
+  }
+};
+
+struct AllTFLPasses : public mlir::PassWrapper<AllTFLPasses,
+                                               mlir::OperationPass<>> {
+  void runOnOperation() override {
+    auto ctx = &getContext();
+    mlir::RewritePatternSet patterns(ctx);
+    patterns.insert(std::make_unique<ReplaceAbsOp>(ctx));
+    patterns.insert(std::make_unique<ReplaceUnpackOp>(ctx));
+    patterns.insert(std::make_unique<ReplaceExpOp>(ctx));
+    patterns.insert(std::make_unique<ReplaceLogOp>(ctx));
+
+    mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+  }
+};
+
+#define SOFTPLUS_LINE_SEGMENTS
+
+struct ReplaceSoftplusOp : public mlir::OpRewritePattern<mlir::TF::SoftplusOp> {
+  ReplaceSoftplusOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TF::SoftplusOp>(ctx, /*benefit=*/1) {}
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::TF::SoftplusOp op, mlir::PatternRewriter &rewriter) const override {
+    llvm::dbgs() << "INFO: SoftplusOp is called!\n";
+
+#ifdef SOFTPLUS_RELU
+    rewriter.replaceOpWithNewOp<mlir::TF::ReluOp>(op, op.getOperand());
+#endif
+
+#ifdef SOFTPLUS_LINE_SEGMENTS
+    const float a = -1.7, b = 1.5, m = b / (b - a), n = 1 - m;
+
+    auto x = op.getOperand();
+    auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+    // TODO: check out broadcasting
+    auto aAttr = mlir::SplatElementsAttr::get(xType, a);
+    auto aConst = rewriter.create<mlir::TF::ConstOp>(
+        op.getLoc(), aAttr.getType(), aAttr);
+    auto xSuba = rewriter.create<mlir::TF::SubOp>(op.getLoc(), x, aConst);
+    auto relu1 = rewriter.create<mlir::TF::ReluOp>(op.getLoc(), xSuba);
+    auto mAttr = mlir::SplatElementsAttr::get(xType, m);
+    auto mConst = rewriter.create<mlir::TF::ConstOp>(
+        op.getLoc(), mAttr.getType(), mAttr);
+    auto part1 = rewriter.create<mlir::TF::MulOp>(op.getLoc(), mConst, relu1);
+
+    auto bAttr = mlir::SplatElementsAttr::get(xType, b);
+    auto bConst = rewriter.create<mlir::TF::ConstOp>(
+        op.getLoc(), bAttr.getType(), bAttr);
+    auto xSubb = rewriter.create<mlir::TF::SubOp>(op.getLoc(), x, bConst);
+    auto relu2 = rewriter.create<mlir::TF::ReluOp>(op.getLoc(), xSubb);
+    auto nAttr = mlir::SplatElementsAttr::get(xType, n);
+    auto nConst = rewriter.create<mlir::TF::ConstOp>(
+        op.getLoc(), nAttr.getType(), nAttr);
+    auto part2 = rewriter.create<mlir::TF::MulOp>(op.getLoc(), nConst, relu2);
+
+    rewriter.replaceOpWithNewOp<mlir::TF::AddOp>(op, part1, part2);
+#endif
+
+#if defined(SOFTPLUS_LEAST_SQ) || defined(SOFTPLUS_REL_LEAST_SQ) || \
+    defined(SOFTPLUS_MINIMAX) || defined(SOFTPLUS_TAYLOR)
+    auto x = op.getOperand();
+
+    // least square in range [-3, 3]
+#ifdef SOFTPLUS_LEAST_SQ
+    float coeffs[] = { 7.14647836e-01, 5.00000000e-01, 9.77047563e-02,
+                       5.83000345e-17 };
+#endif
+#ifdef SOFTPLUS_REL_LEAST_SQ
+    // least square relative in range [-3, 3]
+    float coeffs[] = { 0.70685412, 0.47730485, 0.10013496, 0.00424319 };
+#endif
+#ifdef SOFTPLUS_MINIMAX
+    // minimax approximation in range [-3, 3]
+    float coeffs[] = { 7.19940840e-01, 5.00000000e-01, 9.50489079e-02,
+                       -7.52674478e-23 };
+#endif
+#ifdef SOFTPLUS_TAYLOR
+    // taylor polynomial centered around 0
+    float coeffs[] = { 0.69314718, 0.5, 0.125 };
+    auto sum = PolynomialValue(
+        rewriter, op.getLoc(), x, coeffs, *(&coeffs + 1) - coeffs);
+#endif
+    rewriter.replaceOp(op, {sum});
+#endif
+
+    return mlir::success();
+  }
+};
+
+struct AllTFPasses : public mlir::PassWrapper<AllTFLPasses,
+                                              mlir::OperationPass<>> {
+  void runOnOperation() override {
+    auto ctx = &getContext();
+    mlir::RewritePatternSet patterns(ctx);
+    patterns.insert(std::make_unique<ReplaceSoftplusOp>(ctx));
+
+    mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+  }
+};
+}
 
 namespace tensorflow {
 namespace {
@@ -223,6 +484,10 @@ void AddTFToTFLConversionPasses(const toco::ModelFlags& model_flags,
     pass_manager->addNestedPass<mlir::FuncOp>(
         mlir::TF::CreateInitTextFileToImportPass());
 
+    // EDIT
+    llvm::dbgs() << "INFO: my TF pass is enabled.\n";
+    pass_manager->addPass(std::make_unique<MyPass::AllTFPasses>());
+
     pass_manager->addNestedPass<mlir::FuncOp>(
         mlir::TFL::CreateLegalizeTFPass(pass_config.runtime_verification));
     if (pass_config.enable_tflite_variables) {
@@ -243,11 +508,14 @@ void AddTFToTFLConversionPasses(const toco::ModelFlags& model_flags,
     pass_manager->addNestedPass<mlir::FuncOp>(mlir::createCanonicalizerPass());
     pass_manager->addNestedPass<mlir::FuncOp>(mlir::createCSEPass());
 
+    // EDIT
+    llvm::dbgs() << "INFO: my TFL pass is enabled.\n";
+    pass_manager->addPass(std::make_unique<MyPass::AllTFLPasses>());
+
     // Run quantization after all the floating point model conversion is
     // completed.
-    if (pass_config.quant_specs.RunPropagationAndRewriteQuantizationPasses()) {
+    if (pass_config.quant_specs.RunPropagationAndRewriteQuantizationPasses())
       AddQuantizationPasses(pass_config.quant_specs, pass_manager);
-    }
 
     // This pass should be always at the end of the model
     // conversion (even after quantization). Some TFL ops like unidirectional
