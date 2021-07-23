@@ -52,11 +52,8 @@ if __name__ == "__main__":
     else:
         converter.target_spec.supported_ops = [lite.OpsSet.TFLITE_BUILTINS_INT8]
 
-    # DEBUG
     converter.inference_input_type = tensorflow.python.framework.dtypes.uint8
     converter.inference_output_type = tensorflow.python.framework.dtypes.uint8
-    # converter.inference_input_type = tensorflow.python.framework.dtypes.int8
-    # converter.inference_output_type = tensorflow.python.framework.dtypes.int8
 
     quant_model = converter.convert()
 

@@ -28,12 +28,12 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/tensorflow/transforms/decode_constant.h"
 #include "tensorflow/compiler/mlir/tensorflow/transforms/passes.h"
 #include "tensorflow/compiler/mlir/tensorflow/transforms/tf_saved_model_passes.h"
-#include "tensorflow/compiler/mlir/tensorflow/translate/tf_mlir_translate.h"
-// EDIT
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "tensorflow/compiler/mlir/tensorflow/ir/tf_ops.h"
 #include "tensorflow/compiler/mlir/lite/ir/tfl_ops.h"
-#include "mlir/IR/Verifier.h"
+#include <fstream>
+#include <cfloat>
+#include <cstdlib>
 
 namespace mlir {
 /// Create a pass to convert from the TFExecutor to the TF control dialect.
@@ -41,10 +41,9 @@ std::unique_ptr<OperationPass<FuncOp>>
 CreateTFExecutorToControlDialectConversion();
 }  // namespace mlir
 
-// EDIT
 namespace MyPass {
 struct ReplaceAbsOp : public mlir::OpRewritePattern<mlir::TFL::AbsOp> {
-  ReplaceAbsOp(mlir::MLIRContext *ctx)
+  explicit ReplaceAbsOp(mlir::MLIRContext *ctx)
     : mlir::OpRewritePattern<mlir::TFL::AbsOp>(ctx, /*benefit=*/1) {}
 
   mlir::LogicalResult matchAndRewrite(
@@ -67,7 +66,7 @@ struct ReplaceAbsOp : public mlir::OpRewritePattern<mlir::TFL::AbsOp> {
 };
 
 struct ReplaceUnpackOp : public mlir::OpRewritePattern<mlir::TFL::UnpackOp> {
-  ReplaceUnpackOp(mlir::MLIRContext *ctx)
+  explicit ReplaceUnpackOp(mlir::MLIRContext *ctx)
     : mlir::OpRewritePattern<mlir::TFL::UnpackOp>(ctx, /*benefit=*/1) {}
 
   mlir::LogicalResult matchAndRewrite(
@@ -150,8 +149,10 @@ mlir::Value PolynomialValue(
   return sum;
 }
 
+#define EXP_LEAST_SQ
+
 struct ReplaceExpOp : public mlir::OpRewritePattern<mlir::TFL::ExpOp> {
-  ReplaceExpOp(mlir::MLIRContext *ctx)
+  explicit ReplaceExpOp(mlir::MLIRContext *ctx)
     : mlir::OpRewritePattern<mlir::TFL::ExpOp>(ctx, /*benefit=*/1) {}
 
   mlir::LogicalResult matchAndRewrite(
@@ -160,12 +161,22 @@ struct ReplaceExpOp : public mlir::OpRewritePattern<mlir::TFL::ExpOp> {
 
     auto x = op.getOperand();
 
+#ifdef EXP_LEAST_SQ
     // least square in range [-3, 3]
     float coeffs[] = { 0.59803783, 0.7892836, 0.91375127, 0.26916787 };
+#endif
+#ifdef EXP_REL_LEAST_SQ
     // least square relative in range [-3, 3]
-    // float coeffs[] = { 0.90509352, 1.31294584, 0.78952683, 0.15414826 };
+    float coeffs[] = { 0.90509352, 1.31294584, 0.78952683, 0.15414826 };
+#endif
+#ifdef EXP_MINIMAX
     // minimax approximation in range [-3, 3]
-    // float coeffs[] = { 0.3986013, 0.52297465, 0.99602537, 0.31292411 };
+    float coeffs[] = { 0.3986013, 0.52297465, 0.99602537, 0.31292411 };
+#endif
+#ifdef EXP_TAYLOR
+    // taylor polynomial centered around 0
+    float coeffs[] = { 1.0, 1.0, 0.5, 0.16666666666666666 };
+#endif
     auto sum = PolynomialValue(rewriter, op.getLoc(), x, coeffs, 3);
     rewriter.replaceOp(op, {sum});
 
@@ -173,8 +184,10 @@ struct ReplaceExpOp : public mlir::OpRewritePattern<mlir::TFL::ExpOp> {
   }
 };
 
+#define LOG_LEAST_SQ
+
 struct ReplaceLogOp : public mlir::OpRewritePattern<mlir::TFL::LogOp> {
-  ReplaceLogOp(mlir::MLIRContext *ctx)
+  explicit ReplaceLogOp(mlir::MLIRContext *ctx)
     : mlir::OpRewritePattern<mlir::TFL::LogOp>(ctx, /*benefit=*/1) {}
 
   mlir::LogicalResult matchAndRewrite(
@@ -182,14 +195,24 @@ struct ReplaceLogOp : public mlir::OpRewritePattern<mlir::TFL::LogOp> {
     llvm::dbgs() << "INFO: LogOp is called!\n";
 
     auto x = op.getOperand();
-    auto xType = x.getType().dyn_cast<mlir::ShapedType>();
 
+#ifdef LOG_LEAST_SQ
     // least square in range [exp(-3)+1, exp(3)+1]
     float coeffs[] = { -0.10349343, 0.44997741, -0.02630398, 0.00058021 };
+#endif
+#ifdef LOG_REL_LEAST_SQ
     // least square relative in range [exp(-3)+1, exp(3)+1]
-    // float coeffs[] = { -0.3548069 , 0.54611009, -0.03581849, 0.00085092 };
+    float coeffs[] = { -0.3548069 , 0.54611009, -0.03581849, 0.00085092 };
+#endif
+#ifdef LOG_MINIMAX
     // minimax approximation in range [exp(-3)+1, exp(3)+1]
-    // float coeffs[] = { -0.39904023, 0.57170487, -0.03831855, 0.00091105 };
+    float coeffs[] = { -0.39904023, 0.57170487, -0.03831855, 0.00091105 };
+#endif
+#ifdef LOG_TAYLOR
+    // taylor polynomial centered around ((exp(-3) + 1) + exp(3) + 1) / 2
+    float coeffs[] = { 0.5706941892542055, 0.2710599583854728,
+                       -0.012245583506655708, 0.0002458731374607354 };
+#endif
     auto sum = PolynomialValue(rewriter, op.getLoc(), x, coeffs, 3);
     rewriter.replaceOp(op, {sum});
 
@@ -197,6 +220,7 @@ struct ReplaceLogOp : public mlir::OpRewritePattern<mlir::TFL::LogOp> {
   }
 };
 
+#define MY_TFL_PASS
 struct AllTFLPasses : public mlir::PassWrapper<AllTFLPasses,
                                                mlir::OperationPass<>> {
   void runOnOperation() override {
@@ -211,15 +235,87 @@ struct AllTFLPasses : public mlir::PassWrapper<AllTFLPasses,
   }
 };
 
-#define SOFTPLUS_LINE_SEGMENTS
+class CalibrationData {
+private:
+  constexpr static const char *coeffCalculatorPath_ =
+      "/home/robert/compiler-lab/edgetpu-pass/src/tools/"
+      "poly_approx_get_coeff.py";
+  std::string path_;
+  std::unordered_map<std::string, std::pair<float, float>> data_;
+
+public:
+  explicit CalibrationData(const std::string &path, const std::string &filename)
+    : path_(path) {
+    std::fstream file(path + "/" + filename);
+    std::string opName;
+    while (file >> opName) {
+      float minVal, maxVal;
+      file >> minVal >> maxVal;
+      data_[opName] = std::make_pair(minVal, maxVal);
+    }
+  }
+
+  std::pair<float, float> getRange(mlir::Location loc) const {
+    mlir::NameLoc nameLoc;
+    while (!(nameLoc = loc.dyn_cast<mlir::NameLoc>())) {
+      mlir::CallSiteLoc callSiteLoc;
+      if (callSiteLoc = loc.dyn_cast<mlir::CallSiteLoc>())
+        loc = callSiteLoc.getCallee();
+      else
+        return std::make_pair(FLT_MIN, FLT_MAX);
+    }
+    std::string locName(nameLoc.getName().c_str());
+    std::string opName = locName.substr(
+        0, locName.find_first_of('@')) + ":0";
+
+    auto it = data_.find(opName);
+    if (it == data_.end())
+      return std::make_pair(FLT_MIN, FLT_MAX);
+    return it->second;
+  }
+
+  void getPolyCoeff(mlir::Location loc,
+                    const std::string &function, const std::string &method,
+                    int n, float coeffs[]) const {
+    auto [minVal, maxVal] = getRange(loc);
+    std::string filePath = path_ + "/" + function + "_poly.txt";
+    std::string cmd = std::string(coeffCalculatorPath_) +
+                      " " + function +
+                      " " + method +
+                      " " + std::to_string(n) +
+                      " " + std::to_string(minVal) +
+                      " " + std::to_string(maxVal) +
+                      " " + filePath;
+    std::system(cmd.c_str());
+
+    std::fstream file(filePath);
+    for (int i = 0; i <= n; ++i)
+      file >> coeffs[i];
+
+    llvm::dbgs() << "INFO: range: (" << minVal << ", " << maxVal << "), "
+                 << "calibrated polynomial:";
+    for (int i = 0; i <= n; ++i)
+      llvm::dbgs() << " " << coeffs[i];
+    llvm::dbgs() << "\n";
+  }
+};
+
+#define SOFTPLUS_LEAST_SQ
 
 struct ReplaceSoftplusOp : public mlir::OpRewritePattern<mlir::TF::SoftplusOp> {
-  ReplaceSoftplusOp(mlir::MLIRContext *ctx)
-    : mlir::OpRewritePattern<mlir::TF::SoftplusOp>(ctx, /*benefit=*/1) {}
+  CalibrationData calibrationData_;
+
+  ReplaceSoftplusOp(mlir::MLIRContext *ctx, const std::string &savedModelPath)
+    : mlir::OpRewritePattern<mlir::TF::SoftplusOp>(ctx, /*benefit=*/1),
+      calibrationData_(savedModelPath, "Softplus_calibration.txt") {}
 
   mlir::LogicalResult matchAndRewrite(
       mlir::TF::SoftplusOp op, mlir::PatternRewriter &rewriter) const override {
     llvm::dbgs() << "INFO: SoftplusOp is called!\n";
+
+#ifdef SOFTPLUS_X
+    rewriter.replaceOp(op, {op.getOperand()});
+#endif
 
 #ifdef SOFTPLUS_RELU
     rewriter.replaceOpWithNewOp<mlir::TF::ReluOp>(op, op.getOperand());
@@ -257,27 +353,29 @@ struct ReplaceSoftplusOp : public mlir::OpRewritePattern<mlir::TF::SoftplusOp> {
 #if defined(SOFTPLUS_LEAST_SQ) || defined(SOFTPLUS_REL_LEAST_SQ) || \
     defined(SOFTPLUS_MINIMAX) || defined(SOFTPLUS_TAYLOR)
     auto x = op.getOperand();
+    float coeffs[4];
 
-    // least square in range [-3, 3]
 #ifdef SOFTPLUS_LEAST_SQ
-    float coeffs[] = { 7.14647836e-01, 5.00000000e-01, 9.77047563e-02,
-                       5.83000345e-17 };
+    int degree = 3;
+    calibrationData_.getPolyCoeff(
+        op.getLoc(), "softplus", "least_square", degree, coeffs);
 #endif
 #ifdef SOFTPLUS_REL_LEAST_SQ
-    // least square relative in range [-3, 3]
-    float coeffs[] = { 0.70685412, 0.47730485, 0.10013496, 0.00424319 };
+    int degree = 3;
+    calibrationData_.getPolyCoeff(
+        op.getLoc(), "softplus", "relative_least_square", degree, coeffs);
 #endif
 #ifdef SOFTPLUS_MINIMAX
-    // minimax approximation in range [-3, 3]
-    float coeffs[] = { 7.19940840e-01, 5.00000000e-01, 9.50489079e-02,
-                       -7.52674478e-23 };
+    int degree = 3;
+    calibrationData_.getPolyCoeff(
+        op.getLoc(), "softplus", "minimax", degree, coeffs);
 #endif
 #ifdef SOFTPLUS_TAYLOR
-    // taylor polynomial centered around 0
-    float coeffs[] = { 0.69314718, 0.5, 0.125 };
-    auto sum = PolynomialValue(
-        rewriter, op.getLoc(), x, coeffs, *(&coeffs + 1) - coeffs);
+    int degree = 3;
+    calibrationData_.getPolyCoeff(
+        op.getLoc(), "softplus", "taylor", degree, coeffs);
 #endif
+    auto sum = PolynomialValue(rewriter, op.getLoc(), x, coeffs, degree);
     rewriter.replaceOp(op, {sum});
 #endif
 
@@ -285,12 +383,21 @@ struct ReplaceSoftplusOp : public mlir::OpRewritePattern<mlir::TF::SoftplusOp> {
   }
 };
 
+#define MY_TF_PASS
 struct AllTFPasses : public mlir::PassWrapper<AllTFLPasses,
                                               mlir::OperationPass<>> {
+public:
+  explicit AllTFPasses(const std::string &savedModelPath)
+    : savedModelPath_(savedModelPath) {}
+
+private:
+  std::string savedModelPath_;
+
   void runOnOperation() override {
     auto ctx = &getContext();
     mlir::RewritePatternSet patterns(ctx);
-    patterns.insert(std::make_unique<ReplaceSoftplusOp>(ctx));
+    patterns.insert(std::make_unique<ReplaceSoftplusOp>(
+        ctx, savedModelPath_));
 
     mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
   }
@@ -484,9 +591,11 @@ void AddTFToTFLConversionPasses(const toco::ModelFlags& model_flags,
     pass_manager->addNestedPass<mlir::FuncOp>(
         mlir::TF::CreateInitTextFileToImportPass());
 
-    // EDIT
+#ifdef MY_TF_PASS
     llvm::dbgs() << "INFO: my TF pass is enabled.\n";
-    pass_manager->addPass(std::make_unique<MyPass::AllTFPasses>());
+    pass_manager->addPass(std::make_unique<MyPass::AllTFPasses>(
+        model_flags.saved_model_dir()));
+#endif
 
     pass_manager->addNestedPass<mlir::FuncOp>(
         mlir::TFL::CreateLegalizeTFPass(pass_config.runtime_verification));
@@ -508,9 +617,10 @@ void AddTFToTFLConversionPasses(const toco::ModelFlags& model_flags,
     pass_manager->addNestedPass<mlir::FuncOp>(mlir::createCanonicalizerPass());
     pass_manager->addNestedPass<mlir::FuncOp>(mlir::createCSEPass());
 
-    // EDIT
+#ifdef MY_TFL_PASS
     llvm::dbgs() << "INFO: my TFL pass is enabled.\n";
     pass_manager->addPass(std::make_unique<MyPass::AllTFLPasses>());
+#endif
 
     // Run quantization after all the floating point model conversion is
     // completed.
