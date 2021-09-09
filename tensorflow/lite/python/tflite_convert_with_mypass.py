@@ -32,7 +32,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable-flex",
         dest="enable_flex",
+        action="store_true",
         help="enable select TensorFlow operations",
+    )
+    parser.add_argument(
+        "--enable-mlir-quantizer",
+        dest="enable_mlir_quantizer",
+        action="store_true",
+        help="enable mlir calibration and quantization",
     )
     args = parser.parse_args()
 
@@ -52,10 +59,14 @@ if __name__ == "__main__":
     else:
         converter.target_spec.supported_ops = [lite.OpsSet.TFLITE_BUILTINS_INT8]
 
+    if args.enable_mlir_quantizer:
+        converter.experimental_new_quantizer = True
+    else:
+        converter.experimental_new_quantizer = False
+
     converter.inference_input_type = tensorflow.python.framework.dtypes.uint8
     converter.inference_output_type = tensorflow.python.framework.dtypes.uint8
 
     quant_model = converter.convert()
-
     with open(args.quant_model_path, "wb") as outfile:
         outfile.write(quant_model)

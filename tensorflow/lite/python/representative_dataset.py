@@ -1,4 +1,6 @@
 import numpy as np
+import os
+import PIL.Image
 
 
 class OperationRepresentativeDataset:
@@ -53,13 +55,37 @@ class AbsMobilenetExperimentDataset:
 
 class ModelYOLOv4Dataset:
     name = "model_yolov4"
+    dataset_path = "/home/robert/compiler-lab/yolov4/val2017/"
 
     def __init__(self, inputs):
         self.inputs_ = inputs
 
     def __call__(self):
-        for i in range(len(self.inputs_)):
-            yield [self.inputs_[i: i + 1]]
+        count = 0
+        num_calibration_steps = 200
+        while True:
+            for img_filename in os.listdir(self.dataset_path):
+                img_path = os.path.join(self.dataset_path, img_filename)
+                img = PIL.Image.open(img_path)
+                img = img.resize((416, 416))
+                img = np.array(img).astype(np.float32)
+                yield [np.expand_dims(img / 255, axis=0)]
+                count += 1
+                if count >= num_calibration_steps:
+                    return
+
+
+class ModelVideoCaptioningDataset:
+    name = "model_video_captioning"
+
+    def __init__(self, inputs):
+        self.inputs_ = inputs
+
+    def __call__(self):
+        yield [
+            np.random.random((1, 40, 300)).astype(np.float32),
+            np.random.random((1, 1000)).astype(np.float32),
+        ]
 
 
 representative_datasets = {
@@ -68,4 +94,5 @@ representative_datasets = {
     AbsConvExperimentDataset.name: AbsConvExperimentDataset,
     AbsMobilenetExperimentDataset.name: AbsMobilenetExperimentDataset,
     ModelYOLOv4Dataset.name: ModelYOLOv4Dataset,
+    ModelVideoCaptioningDataset.name: ModelVideoCaptioningDataset
 }

@@ -25,6 +25,9 @@ limitations under the License.
 #include "tensorflow/lite/kernels/kernel_util.h"
 #include "tensorflow/lite/string_util.h"
 
+// DEBUG
+#include <iostream>
+
 namespace tflite {
 namespace ops {
 namespace builtin {
@@ -60,6 +63,33 @@ TfLiteStatus ResizeOutput(TfLiteContext* context, TfLiteNode* node) {
 
   const int num_dimensions = NumDimensions(input);
   const int num_multipliers = NumElements(multipliers);
+
+  // DEBUG
+  if (num_dimensions != num_multipliers) {
+    std::cout << "INFO: num_dimensions (" << num_dimensions << ") != "
+              << "num_multipliers (" << num_multipliers << ")\n";
+    std::cout << "INFO: input (name: " << input->name << ") dimensions: [";
+    for (int i = 0; i < input->dims->size; ++i) {
+      if (i != 0)
+        std::cout << ", ";
+      std::cout << input->dims->data[i];
+    }
+    std::cout << "]\n";
+    std::cout << "INFO: multipliers (dimensions: [";
+    for (int i = 0; i < multipliers->dims->size; ++i) {
+      if (i != 0)
+        std::cout << ", ";
+      std::cout << multipliers->dims->data[i];
+    }
+    std::cout << "], type: " << multipliers->type << "): [";
+    for (int i = 0; i < multipliers->dims->data[0]; ++i) {
+      if (i != 0)
+        std::cout << ", ";
+      std::cout << multipliers->data.i32[i];
+    }
+    std::cout << "]\n";
+  }
+
   TF_LITE_ENSURE_EQ(context, num_dimensions, num_multipliers);
   switch (multipliers->type) {
     case kTfLiteInt32:

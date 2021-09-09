@@ -647,6 +647,12 @@ class TFLiteConverterBase(object):
         calibrate_quantize = _calibrator.Calibrator(
             result, custom_op_registerers_by_name, custom_op_registerers_by_func
         )
+
+        # DEBUG
+        print("============== Calibrator =============")
+        with open("/home/robert/Downloads/model_quant.tflite", "wb") as outfile:
+            outfile.write(result)
+
         if self._experimental_calibrate_only or self.experimental_new_quantizer:
             calibrated = calibrate_quantize.calibrate(
                 self.representative_dataset.input_gen
@@ -1113,6 +1119,10 @@ class TFLiteSavedModelConverterV2(TFLiteConverterBaseV2):
         calibrate_and_quantize, flags = quant_mode.quantizer_flags()
         if calibrate_and_quantize:
             result = self._calibrate_quantize_model(result, **flags)
+
+            # DEBUG
+            with open("/home/robert/Downloads/model_quant.tflite", "wb") as f:
+                f.write(result)
 
         flags_modify_model_io_type = quant_mode.flags_modify_model_io_type(
             self.inference_input_type, self.inference_output_type
