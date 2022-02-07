@@ -31,6 +31,7 @@ limitations under the License.
 #include "mlir/Support/LogicalResult.h"  // from @llvm-project
 #include "tensorflow/compiler/mlir/lite/utils/validators.h"
 #include "tensorflow/compiler/mlir/tensorflow/ir/tf_ops.h"
+#include <fstream>
 
 namespace mlir {
 namespace TFL {
@@ -83,6 +84,14 @@ class ConvertTFDilatedConvOp : public OpRewritePattern<Conv2dOpTy> {
 template <typename Conv2dOpTy>
 LogicalResult ConvertTFDilatedConvOp<Conv2dOpTy>::matchAndRewrite(
     Conv2dOpTy op, PatternRewriter& rewriter) const {
+  // DEBUG
+  /*
+  llvm::dbgs() << "INFO: ConvertTFDilatedConvOp is called!\n";
+  std::error_code ec;
+  llvm::raw_fd_ostream outfile("/home/robert/Downloads/model.mlir", ec);
+  op->getBlock()->print(outfile);
+  */
+
   if (!op.getResult().hasOneUse()) {
     return rewriter.notifyMatchFailure(
         op, "result for current op has more than 1 use");

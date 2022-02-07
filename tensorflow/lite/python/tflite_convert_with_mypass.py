@@ -41,31 +41,38 @@ if __name__ == "__main__":
         action="store_true",
         help="enable mlir calibration and quantization",
     )
+    parser.add_argument(
+        "--float",
+        dest="float",
+        action="store_true",
+        help="output float model instead of quantized model",
+    )
     args = parser.parse_args()
 
     inputs = np.load(args.inputs_path)
     converter = lite.TFLiteConverterV2.from_saved_model(args.model_dir)
     converter.optimizations = [lite.Optimize.DEFAULT]
-    converter.representative_dataset = (
-        representative_dataset.representative_datasets[
-            args.representative_dataset
-        ](inputs)
-    )
-    if args.enable_flex:
-        converter.target_spec.supported_ops = [
-            lite.OpsSet.TFLITE_BUILTINS_INT8,
-            lite.OpsSet.SELECT_TF_OPS,
-        ]
-    else:
-        converter.target_spec.supported_ops = [lite.OpsSet.TFLITE_BUILTINS_INT8]
+    if not args.float:
+        converter.representative_dataset = (
+            representative_dataset.representative_datasets[
+                args.representative_dataset
+            ](inputs)
+        )
+        if args.enable_flex:
+            converter.target_spec.supported_ops = [
+                lite.OpsSet.TFLITE_BUILTINS_INT8,
+                lite.OpsSet.SELECT_TF_OPS,
+            ]
+        else:
+            converter.target_spec.supported_ops = [lite.OpsSet.TFLITE_BUILTINS_INT8]
 
-    if args.enable_mlir_quantizer:
-        converter.experimental_new_quantizer = True
-    else:
-        converter.experimental_new_quantizer = False
+        if args.enable_mlir_quantizer:
+            converter.experimental_new_quantizer = True
+        else:
+            converter.experimental_new_quantizer = False
 
-    converter.inference_input_type = tensorflow.python.framework.dtypes.uint8
-    converter.inference_output_type = tensorflow.python.framework.dtypes.uint8
+        converter.inference_input_type = tensorflow.python.framework.dtypes.uint8
+        converter.inference_output_type = tensorflow.python.framework.dtypes.uint8
 
     quant_model = converter.convert()
     with open(args.quant_model_path, "wb") as outfile:

@@ -25,6 +25,9 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/tensorflow/transforms/passes.h"
 #include "tensorflow/compiler/mlir/tools/kernel_gen/ir/tf_framework_ops.h"
 #include "tensorflow/core/platform/init_main.h"
+// EDIT
+#include "mlir/Pass/PassRegistry.h"
+#include "tensorflow/compiler/mlir/lite/tf_tfl_passes.h"
 
 int main(int argc, char **argv) {
   tensorflow::InitMlir y(&argc, &argv);
@@ -33,6 +36,12 @@ int main(int argc, char **argv) {
   mlir::registerTensorFlowPasses();
   mlir::mhlo::registerAllMhloPasses();
   mlir::lmhlo::registerAllLmhloPasses();
+  // EDIT
+  mlir::registerPass("my-pass",
+                     "Convert unsupported TPU operations to supported ones",
+                     []() -> std::unique_ptr<mlir::Pass> {
+    return std::make_unique<MyPass::AllTFLPasses>();
+  });
 
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);

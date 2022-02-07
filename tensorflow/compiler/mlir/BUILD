@@ -85,6 +85,8 @@ cc_library(
         "@llvm-project//mlir:AllPassesAndDialectsNoRegistration",
         "@llvm-project//mlir:MlirOptLib",
         "@llvm-project//mlir:Shape",
+        # EDIT
+        "//tensorflow/compiler/mlir/lite:tf_tfl_passes",
     ],
 )
 
