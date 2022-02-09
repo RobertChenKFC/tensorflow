@@ -36,6 +36,1788 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/tensorflow/transforms/tf_saved_model_passes.h"
 #include "tensorflow/compiler/mlir/tensorflow/translate/tf_mlir_translate.h"
 
+namespace MyPass {
+CalibrationData::CalibrationData(const std::string &path,
+                                 const std::string &filename) : path_(path) {
+  std::fstream file(path + "/" + filename);
+  std::string opName;
+  while (file >> opName) {
+    float minVal, maxVal;
+    file >> minVal >> maxVal;
+    data_[opName] = std::make_pair(minVal, maxVal);
+  }
+}
+
+std::pair<float, float> CalibrationData::getRange(mlir::Location loc) const {
+  mlir::NameLoc nameLoc;
+  while (!(nameLoc = loc.dyn_cast<mlir::NameLoc>())) {
+    mlir::CallSiteLoc callSiteLoc;
+    if (callSiteLoc = loc.dyn_cast<mlir::CallSiteLoc>())
+      loc = callSiteLoc.getCallee();
+    else
+      return std::make_pair(FLT_MIN, FLT_MAX);
+  }
+  auto locName = nameLoc.getName().getValue().str();
+  auto opName = locName.substr(
+      0, locName.find_first_of('@')) + ":0";
+
+  auto it = data_.find(opName);
+  if (it == data_.end())
+    return std::make_pair(FLT_MIN, FLT_MAX);
+  return it->second;
+}
+
+void CalibrationData::getPolyCoeff(
+    mlir::Location loc, const std::string &function, const std::string &method,
+    int n, float coeffs[]) const {
+  auto [minVal, maxVal] = getRange(loc);
+  std::string filePath = path_ + "/" + function + "_poly.txt";
+  std::string cmd = std::string(coeffCalculatorPath_) +
+                    " " + function +
+                    " " + method +
+                    " " + std::to_string(n) +
+                    " " + std::to_string(minVal) +
+                    " " + std::to_string(maxVal) +
+                    " " + filePath;
+  std::system(cmd.c_str());
+
+  std::fstream file(filePath);
+  for (int i = 0; i <= n; ++i)
+    file >> coeffs[i];
+
+  llvm::dbgs() << "INFO: range: (" << minVal << ", " << maxVal << "), "
+               << "calibrated polynomial:";
+  for (int i = 0; i <= n; ++i)
+    llvm::dbgs() << " " << coeffs[i];
+  llvm::dbgs() << "\n";
+}
+
+ReplaceAbsOp::ReplaceAbsOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::AbsOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceAbsOp::matchAndRewrite(
+    mlir::TFL::AbsOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: AbsOp is called!\n";
+
+  auto x = op.getOperand();
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+  auto zeroType = mlir::RankedTensorType::get(xType.getShape(),
+                                              xType.getElementType());
+  auto zeroAttr = mlir::SplatElementsAttr::get(zeroType, 0);
+  auto zero = rewriter.create<mlir::TFL::ConstOp>(op.getLoc(), zeroType,
+                                                  zeroAttr);
+  auto negX = rewriter.create<mlir::TFL::SubOp>(
+      op.getLoc(), zero, x, rewriter.getStringAttr("NONE"));
+  auto max = rewriter.replaceOpWithNewOp<mlir::TFL::MaximumOp>(op, x, negX);
+
+  return mlir::success();
+}
+
+ReplaceLeakyReluOp::ReplaceLeakyReluOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::LeakyReluOp>(ctx, /*benefit=*/1) {}
+
+#define LEAKY_RELU_PRELU
+mlir::LogicalResult ReplaceLeakyReluOp::matchAndRewrite(
+    mlir::TFL::LeakyReluOp op,
+    mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: LeakyReluOp is called!\n";
+
+  auto x = op.getOperand();
+  auto resultType = op.getResult().getType();
+
+#ifdef LEAKY_RELU_RELU
+  rewriter.replaceOpWithNewOp<mlir::TFL::ReluOp>(op, x);
+#endif
+
+#if defined(LEAKY_RELU_PRELU) || defined(LEAKY_RELU_X_ALPHAX) || \
+    defined(LEAKY_RELU_POS_NEG)
+  auto alphaOldAttr = op->getAttr("alpha");
+  auto alpha = alphaOldAttr.dyn_cast<mlir::FloatAttr>().getValue()
+      .convertToFloat();
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+  auto alphaShape = xType.getShape().vec();
+  alphaShape.erase(alphaShape.begin());
+  for (auto &dim : alphaShape)
+    dim = 1;
+  auto alphaType = xType.clone(alphaShape);
+  auto alphaAttr = mlir::SplatElementsAttr::get(alphaType, alpha);
+  auto alphaConst = rewriter.create<mlir::TFL::ConstOp>(
+      op.getLoc(), alphaAttr.getType(), alphaAttr);
+#endif
+
+#ifdef LEAKY_RELU_PRELU
+  // Replace leaky-relu with PRelu
+  rewriter.replaceOpWithNewOp<mlir::TFL::PReluOp>(op, resultType, x, alphaConst);
+#endif
+
+#ifdef LEAKY_RELU_X_ALPHAX
+  // Replace leaky-relu with max(x, alpha * x); this is correct only if
+  // 0 < alpha < 1
+  auto noActivationAttr = rewriter.getStringAttr("NONE");
+  auto alphaX = rewriter.create<mlir::TFL::MulOp>(
+      op.getLoc(), alphaConst, x, noActivationAttr);
+  rewriter.replaceOpWithNewOp<mlir::TFL::MaximumOp>(op, x, alphaX);
+#endif
+
+#ifdef LEAKY_RELU_POS_NEG
+  // Replace leaky-relu with relu(x) - alpha * relu(-x)
+  auto pos = rewriter.create<mlir::TFL::ReluOp>(op.getLoc(), x);
+  auto zeroAttr = mlir::SplatElementsAttr::get(alphaType, 0);
+  auto zero = rewriter.create<mlir::TFL::ConstOp>(
+      op.getLoc(), zeroAttr.getType(), zeroAttr);
+  auto noActivationAttr = rewriter.getStringAttr("NONE");
+  auto negX = rewriter.create<mlir::TFL::SubOp>(
+      op.getLoc(), zero, x, noActivationAttr);
+  auto reluNegX = rewriter.create<mlir::TFL::ReluOp>(op.getLoc(), negX);
+  auto neg = rewriter.create<mlir::TFL::MulOp>(
+      op.getLoc(), alphaConst, reluNegX, noActivationAttr);
+  auto newOp = rewriter.replaceOpWithNewOp<mlir::TFL::SubOp>(
+      op, pos, neg, noActivationAttr);
+#endif
+
+  return mlir::success();
+}
+
+ReplaceTileOp::ReplaceTileOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::TileOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceTileOp::matchAndRewrite(
+    mlir::TFL::TileOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: TileOp is called!\n";
+
+  auto x = op.getOperand(0);
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+  auto xShape = xType.getShape().vec();
+
+  auto multiplesOp = mlir::dyn_cast<mlir::ConstantOp>(
+      op.getOperand(1).getDefiningOp());
+  auto multiplesAttr = multiplesOp->getAttr("value").dyn_cast<
+      mlir::DenseElementsAttr>();
+
+  int axis = 0;
+  auto result = x;
+  llvm::SmallVector<mlir::Value, 5> xs;
+  for (auto multiple : multiplesAttr.getValues<int>()) {
+    if (multiple > 1) {
+      xs.clear();
+      for (uint64_t i = 0; i < multiple; ++i)
+        xs.push_back(result);
+      xShape[axis] *= multiple;
+      auto concatType = mlir::RankedTensorType::get(
+          xShape, xType.getElementType());
+      result = rewriter.create<mlir::TFL::ConcatenationOp>(
+          op.getLoc(), concatType, xs, axis, "NONE");
+    }
+    ++axis;
+  }
+  rewriter.replaceOp(op, {result});
+
+  return mlir::success();
+}
+
+#define UNPACK_TFL
+ReplaceTFLUnpackOp::ReplaceTFLUnpackOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::UnpackOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceTFLUnpackOp::matchAndRewrite(
+    mlir::TFL::UnpackOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: UnpackOp is called!\n";
+
+  auto x = op.getOperand();
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+
+  auto numAttr = op->getAttr("num").dyn_cast<mlir::IntegerAttr>();
+  auto num = numAttr.getInt();
+  auto axisAttr = op->getAttr("axis").dyn_cast<mlir::IntegerAttr>();
+  auto axis = axisAttr.getInt();
+
+  auto size = static_cast<int64_t>(xType.getShape().size());
+  auto stridedSliceInputShape = llvm::ArrayRef<int64_t>(size);
+  auto stridedSliceInputType = mlir::RankedTensorType::get(
+      stridedSliceInputShape, rewriter.getI32Type());
+  auto strideAttr = mlir::SplatElementsAttr::get(stridedSliceInputType, 1);
+  auto strideConst = rewriter.create<mlir::TFL::ConstOp>(
+      op.getLoc(), strideAttr.getType(), strideAttr);
+
+  auto slicedXShape = xType.getShape().vec();
+  slicedXShape.erase(slicedXShape.begin() + axis);
+  auto slicedXType =
+      mlir::RankedTensorType::get(slicedXShape, xType.getElementType());
+
+  auto zerosMask = rewriter.getI32IntegerAttr(0);
+  auto shrinkAxisMask = rewriter.getI32IntegerAttr(1 << axis);
+
+  std::vector<mlir::Value> slicedXs;
+  slicedXs.reserve(num);
+  for (long i = 0; i < num; ++i) {
+    auto beginVals = std::vector<int32_t>(xType.getShape().size(), 0);
+    beginVals[axis] = i;
+    auto beginAttr = rewriter.getI32TensorAttr(beginVals);
+    auto beginConst = rewriter.create<mlir::TFL::ConstOp>(
+        op.getLoc(), beginAttr.getType(), beginAttr);
+
+    // TODO: check if the vector can be reused
+    auto endVals = std::vector<int32_t>();
+    endVals.reserve(xType.getShape().size());
+    for (auto dim : xType.getShape())
+      endVals.push_back(static_cast<int32_t>(dim));
+    endVals[axis] = i + 1;
+    auto endAttr = rewriter.getI32TensorAttr(endVals);
+    auto endConst = rewriter.create<mlir::TFL::ConstOp>(
+        op.getLoc(), endAttr.getType(), endAttr);
+
+    auto slicedX = rewriter.create<mlir::TFL::StridedSliceOp>(
+        op.getLoc(), slicedXType, x, beginConst, endConst, strideConst,
+        zerosMask, zerosMask, zerosMask, zerosMask, shrinkAxisMask);
+    slicedXs.push_back(slicedX);
+  }
+
+  rewriter.replaceOp(op, slicedXs);
+
+  return mlir::success();
+}
+
+#define EXP_DISABLE
+#define EXP_LEAST_SQ
+ReplaceExpOp::ReplaceExpOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::ExpOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceExpOp::matchAndRewrite(
+    mlir::TFL::ExpOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: ExpOp is called!\n";
+
+  auto x = op.getOperand();
+
+#ifdef EXP_LEAST_SQ
+  // least square in range [-3, 3]
+  float coeffs[] = { 0.59803783, 0.7892836, 0.91375127, 0.26916787 };
+#endif
+#ifdef EXP_REL_LEAST_SQ
+  // least square relative in range [-3, 3]
+  float coeffs[] = { 0.90509352, 1.31294584, 0.78952683, 0.15414826 };
+#endif
+#ifdef EXP_MINIMAX
+  // minimax approximation in range [-3, 3]
+  float coeffs[] = { 0.3986013, 0.52297465, 0.99602537, 0.31292411 };
+#endif
+#ifdef EXP_TAYLOR
+  // taylor polynomial centered around 0
+  float coeffs[] = { 1.0, 1.0, 0.5, 0.16666666666666666 };
+#endif
+  auto sum = PolynomialValueTFL(rewriter, op.getLoc(), x, coeffs, 3);
+  rewriter.replaceOp(op, {sum});
+
+  return mlir::success();
+}
+
+#define LOG_DISABLE
+#define LOG_LEAST_SQ
+ReplaceLogOp::ReplaceLogOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::LogOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceLogOp::matchAndRewrite(
+    mlir::TFL::LogOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: LogOp is called!\n";
+
+  auto x = op.getOperand();
+
+#ifdef LOG_LEAST_SQ
+  // least square in range [exp(-3)+1, exp(3)+1]
+  float coeffs[] = { -0.10349343, 0.44997741, -0.02630398, 0.00058021 };
+#endif
+#ifdef LOG_REL_LEAST_SQ
+  // least square relative in range [exp(-3)+1, exp(3)+1]
+  float coeffs[] = { -0.3548069 , 0.54611009, -0.03581849, 0.00085092 };
+#endif
+#ifdef LOG_MINIMAX
+  // minimax approximation in range [exp(-3)+1, exp(3)+1]
+  float coeffs[] = { -0.39904023, 0.57170487, -0.03831855, 0.00091105 };
+#endif
+#ifdef LOG_TAYLOR
+  // taylor polynomial centered around ((exp(-3) + 1) + exp(3) + 1) / 2
+  float coeffs[] = { 0.5706941892542055, 0.2710599583854728,
+                     -0.012245583506655708, 0.0002458731374607354 };
+#endif
+  auto sum = PolynomialValueTFL(rewriter, op.getLoc(), x, coeffs, 3);
+  rewriter.replaceOp(op, {sum});
+
+  return mlir::success();
+}
+
+ReplaceFullyConnectedOp::ReplaceFullyConnectedOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::FullyConnectedOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceFullyConnectedOp::matchAndRewrite(
+    mlir::TFL::FullyConnectedOp op,
+    mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: FullyConnectedOp is called!\n";
+
+  auto input = op.getOperand(0);
+  auto inputType = input.getType().dyn_cast<mlir::ShapedType>();
+  auto inputShape = inputType.getShape();
+
+#ifdef FULLY_CONNECTED_NO_KEEP_DIMS
+  if (op->getAttrOfType<mlir::BoolAttr>("keep_num_dims").getValue()) {
+    rewriter.replaceOpWithNewOp<mlir::TFL::FullyConnectedOp>(
+        op, op.getResult(0).getType(), op.getOperand(0),
+        op.getOperand(1), op.getOperand(2),
+        op->getAttrOfType<mlir::StringAttr>("fused_activation_function"),
+        op->getAttrOfType<mlir::StringAttr>("weights_format"),
+        rewriter.getBoolAttr(false));
+
+    llvm::dbgs() << "Keep num dims was originally true.\n";
+
+    return mlir::success();
+  }
+#endif
+
+  if (inputShape.size() == 3 && inputShape.front() > 1) {
+    auto batchSize = inputShape.front();
+    auto splitDimNum = static_cast<int32_t>(0);
+    auto splitDimArr = llvm::ArrayRef<int32_t>(splitDimNum);
+    auto splitDimAttr = rewriter.getI32TensorAttr(splitDimArr);
+    auto splitDim = rewriter.create<mlir::TFL::ConstOp>(
+        op.getLoc(), splitDimAttr.getType(), splitDimAttr);
+
+    auto splittedShapeVec = std::vector<int64_t>(inputShape.vec());
+    splittedShapeVec.front() = 1;
+    auto splittedShape = llvm::ArrayRef<int64_t>(splittedShapeVec);
+    auto splittedType = mlir::RankedTensorType::get(
+        splittedShape, inputType.getElementType());
+    auto splittedTypesVec = std::vector<mlir::Type>(batchSize, splittedType);
+    auto splittedTypes = llvm::ArrayRef<mlir::Type>(splittedTypesVec);
+    auto splittedInputs = rewriter.create<mlir::TFL::SplitOp>(
+        op.getLoc(), splittedTypes, splitDim, input, batchSize);
+
+    auto outputType = op.getResult(0).getType().dyn_cast<mlir::ShapedType>();
+    auto outputShape = outputType.getShape();
+    auto resultShapeVec = std::vector<int64_t>(outputShape.vec());
+    resultShapeVec.front() = 1;
+    auto resultShape = llvm::ArrayRef<int64_t>(resultShapeVec);
+    auto resultType = mlir::RankedTensorType::get(
+        resultShape, outputType.getElementType());
+
+    auto resultsVec = std::vector<mlir::Value>();
+    resultsVec.reserve(batchSize);
+    for (auto splittedInput : splittedInputs.getResults()) {
+      auto result = rewriter.create<mlir::TFL::FullyConnectedOp>(
+          op.getLoc(), resultType, splittedInput,
+          op.getOperand(1), op.getOperand(2),
+          op->getAttrOfType<mlir::StringAttr>("fused_activation_function"),
+          op->getAttrOfType<mlir::StringAttr>("weights_format"),
+          op->getAttrOfType<mlir::BoolAttr>("keep_num_dims"),
+          op->getAttrOfType<mlir::BoolAttr>("asymmetric_quantize_inputs"));
+      resultsVec.push_back(result.getResult(0));
+    }
+
+    auto results = llvm::ArrayRef<mlir::Value>(resultsVec);
+    auto result = rewriter.replaceOpWithNewOp<mlir::TFL::ConcatenationOp>(
+        op, outputType, results, 0, "NONE");
+
+    // DEBUG
+    llvm::dbgs() << "Result: ";
+    result.dump();
+
+    return mlir::success();
+  }
+
+#ifdef FULLY_CONNECTED_REDUCE_DIM
+  // TODO: see if this can be extended to higher dimensions
+  if (inputShape.size() == 3) {
+    auto newInputShapeVec = std::vector<int64_t>({
+      inputShape[0] * inputShape[1], inputShape[2]});
+    auto reshapedInput = Reshape(
+        rewriter, op.getLoc(), input, inputType, newInputShapeVec);
+
+    auto weights = op.getOperand(1);
+    auto weightsType = weights.getType().dyn_cast<mlir::ShapedType>();
+    auto weightsShape = weightsType.getShape();
+    auto newFullyConnectedShapeVec = std::vector<int64_t>(newInputShapeVec);
+    newFullyConnectedShapeVec.back() = weightsShape.back();
+    auto newFullyConnectedShape = llvm::ArrayRef<int64_t>(
+        newFullyConnectedShapeVec);
+    auto outputType = op.getResult(0).getType().dyn_cast<mlir::ShapedType>();
+    auto newFullyConnectedType = mlir::RankedTensorType::get(
+        newFullyConnectedShape, outputType.getElementType());
+    auto newFullyConnected = rewriter.create<mlir::TFL::FullyConnectedOp>(
+        op.getLoc(), newFullyConnectedType, reshapedInput,
+        op.getOperand(1), op.getOperand(2),
+        op->getAttrOfType<mlir::StringAttr>("fused_activation_function"),
+        op->getAttrOfType<mlir::StringAttr>("weights_format"),
+        // DEBUG
+        // op->getAttrOfType<mlir::BoolAttr>("keep_num_dims")
+        rewriter.getBoolAttr(false));
+
+    auto outputShapeLongVec = outputType.getShape().vec();
+    auto outputShapeVec = std::vector<int64_t>();
+    for (auto dim : outputShapeLongVec)
+      outputShapeVec.push_back(static_cast<int64_t>(dim));
+    auto output = Reshape(
+        rewriter, op.getLoc(), newFullyConnected.getResult(0),
+        newFullyConnectedType, outputShapeVec);
+
+    // DEBUG
+    llvm::dbgs() << "newFullyConnected: ";
+    newFullyConnected.dump();
+    llvm::dbgs() << "output: ";
+    output.dump();
+
+    rewriter.replaceOp(op, {output});
+  } else if (inputShape.size() == 2 && inputShape[0] > 1) {
+    // TODO: test using unpack
+    auto batchSize = static_cast<int64_t>(inputShape[0]);
+    auto numDim = static_cast<int64_t>(2);
+    auto stridedSliceInputShape = llvm::ArrayRef<int64_t>(numDim);
+    auto stridedSliceInputType = mlir::RankedTensorType::get(
+        stridedSliceInputShape, rewriter.getI32Type());
+    auto strideAttr = mlir::SplatElementsAttr::get(stridedSliceInputType, 1);
+    auto strideConst = rewriter.create<mlir::TFL::ConstOp>(
+        op.getLoc(), strideAttr.getType(), strideAttr);
+
+    auto slicedInputShape = inputShape.vec();
+    // DEBUG
+    // slicedInputShape.erase(slicedInputShape.begin());
+    slicedInputShape.front() = 1;
+    auto slicedInputType = mlir::RankedTensorType::get(
+        slicedInputShape, inputType.getElementType());
+
+    auto zerosMask = rewriter.getI32IntegerAttr(0);
+    // DEBUG
+    // auto shrinkAxisMask = rewriter.getI32IntegerAttr(1);
+    auto shrinkAxisMask = rewriter.getI32IntegerAttr(0);
+
+    auto weights = op.getOperand(1);
+    auto weightsType = weights.getType().dyn_cast<mlir::ShapedType>();
+    auto weightsShape = weightsType.getShape();
+    auto bias = op.getOperand(2);
+
+    // DEBUG
+    // auto resultShapeVec = std::vector<int64_t>({weightsShape.back()});
+    auto resultShapeVec = std::vector<int64_t>({1, weightsShape.back()});
+    auto resultShape = llvm::ArrayRef<int64_t>(resultShapeVec);
+    auto outputType = op.getResult(0).getType().dyn_cast<mlir::ShapedType>();
+    auto resultType = mlir::RankedTensorType::get(
+        resultShape, outputType.getElementType());
+    std::vector<mlir::Value> resultsVec;
+    resultsVec.reserve(batchSize);
+    for (int i = 0; i < batchSize; ++i) {
+      // TODO: fix the unpack op's begin and end vals
+      auto beginVals = std::vector<int32_t>({i, 0});
+      auto beginAttr = rewriter.getI32TensorAttr(beginVals);
+      auto beginConst = rewriter.create<mlir::TFL::ConstOp>(
+          op.getLoc(), beginAttr.getType(), beginAttr);
+
+      // TODO: check if the vector can be reused
+      auto endVals = std::vector<int32_t>(
+          {i + 1, static_cast<int32_t>(weightsShape.back())});
+      auto endAttr = rewriter.getI32TensorAttr(endVals);
+      auto endConst = rewriter.create<mlir::TFL::ConstOp>(
+          op.getLoc(), endAttr.getType(), endAttr);
+
+      auto slicedInput = rewriter.create<mlir::TFL::StridedSliceOp>(
+          op.getLoc(), slicedInputType, input, beginConst, endConst,
+          strideConst, zerosMask, zerosMask, zerosMask, zerosMask,
+          shrinkAxisMask);
+
+      // DEBUG
+      llvm::dbgs() << "slicedInput: ";
+      slicedInput.dump();
+
+      auto result = rewriter.create<mlir::TFL::FullyConnectedOp>(
+          op.getLoc(), resultType, slicedInput, weights, bias,
+          op->getAttrOfType<mlir::StringAttr>("fused_activation_function"),
+          op->getAttrOfType<mlir::StringAttr>("weights_format"),
+          // DEBUG
+          // op->getAttrOfType<mlir::BoolAttr>("keep_num_dims")
+          rewriter.getBoolAttr(false));
+
+      // DEBUG
+      llvm::dbgs() << "slicedResult: ";
+      result.dump();
+
+      resultsVec.push_back(result.getResult(0));
+    }
+
+    auto results = llvm::ArrayRef<mlir::Value>(resultsVec);
+    // DEBUG
+    /*
+    auto result = rewriter.replaceOpWithNewOp<mlir::TFL::PackOp>(
+        op, outputType, results,
+        static_cast<int32_t>(batchSize), static_cast<int32_t>(0));
+    */
+    auto result = rewriter.replaceOpWithNewOp<mlir::TFL::ConcatenationOp>(
+        op, outputType, results, static_cast<int32_t>(0), "NONE");
+
+    // DEBUG
+    llvm::dbgs() << "result: ";
+    result.dump();
+
+    return mlir::success();
+  }
+#endif
+
+  return mlir::failure();
+}
+
+ReplaceSplitOp::ReplaceSplitOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::SplitOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceSplitOp::matchAndRewrite(
+    mlir::TFL::SplitOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: SplitOp is called!\n";
+
+  auto splitDim = op.getOperand(0);
+  auto splitDimAttr = splitDim.getDefiningOp()->getAttrOfType<
+      mlir::ElementsAttr>("value");
+  auto splitDimVec = splitDimAttr.getValues<int32_t>();
+  auto axis = *splitDimVec.begin();
+
+  // DEBUG
+  llvm::dbgs() << "axis: " << axis << "\n";
+
+  if (axis == 0) {
+    auto x = op.getOperand(1);
+    auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+
+    auto numAttr = op->getAttr("num_splits").dyn_cast<mlir::IntegerAttr>();
+    auto num = numAttr.getInt();
+
+    auto size = static_cast<int64_t>(xType.getShape().size());
+    auto stridedSliceInputShape = llvm::ArrayRef<int64_t>(size);
+    auto stridedSliceInputType = mlir::RankedTensorType::get(
+        stridedSliceInputShape, rewriter.getI32Type());
+    auto strideAttr = mlir::SplatElementsAttr::get(stridedSliceInputType, 1);
+    auto strideConst = rewriter.create<mlir::TFL::ConstOp>(
+        op.getLoc(), strideAttr.getType(), strideAttr);
+
+    auto slicedXShape = xType.getShape().vec();
+    slicedXShape[axis] = 1;
+    auto slicedXType =
+        mlir::RankedTensorType::get(slicedXShape, xType.getElementType());
+
+    auto zerosMask = rewriter.getI32IntegerAttr(0);
+
+    std::vector<mlir::Value> slicedXs;
+    slicedXs.reserve(num);
+    for (long i = 0; i < num; ++i) {
+      auto beginVals = std::vector<int32_t>(xType.getShape().size(), 0);
+      beginVals[axis] = i;
+      auto beginAttr = rewriter.getI32TensorAttr(beginVals);
+      auto beginConst = rewriter.create<mlir::TFL::ConstOp>(
+          op.getLoc(), beginAttr.getType(), beginAttr);
+
+      // TODO: check if the vector can be reused
+      auto endVals = std::vector<int32_t>();
+      endVals.reserve(xType.getShape().size());
+      for (auto dim : xType.getShape())
+        endVals.push_back(static_cast<int32_t>(dim));
+      endVals[axis] = i + 1;
+      auto endAttr = rewriter.getI32TensorAttr(endVals);
+      auto endConst = rewriter.create<mlir::TFL::ConstOp>(
+          op.getLoc(), endAttr.getType(), endAttr);
+
+      auto slicedX = rewriter.create<mlir::TFL::StridedSliceOp>(
+          op.getLoc(), slicedXType, x, beginConst, endConst, strideConst,
+          zerosMask, zerosMask, zerosMask, zerosMask, zerosMask);
+      slicedXs.push_back(slicedX);
+    }
+
+    rewriter.replaceOp(op, slicedXs);
+
+    return mlir::success();
+  }
+
+  return mlir::failure();
+}
+
+ReplaceMeanOp::ReplaceMeanOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::MeanOp>(ctx, /*benefit=*/1) {}
+
+#define MEAN_RESHAPE
+mlir::LogicalResult ReplaceMeanOp::matchAndRewrite(
+    mlir::TFL::MeanOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: MeanOp is called!\n";
+
+  auto x = op.getOperand(0);
+  auto resultType = op.getResult().getType();
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+  auto xShapeVec = xType.getShape().vec();
+  auto keepDims = op->getAttrOfType<mlir::BoolAttr>(
+      "keep_dims").getValue();
+
+  auto axisAttr = op.getOperand(1).getDefiningOp()->getAttr("value");
+  auto axisElementsAttr = axisAttr.dyn_cast<mlir::ElementsAttr>();
+  auto axis = std::vector<int32_t>();
+  for (auto x : axisElementsAttr.getValues<int32_t>())
+    axis.push_back(x);
+  if (xShapeVec.front() == 1 && axis.size() > 1) {
+#ifdef MEAN_SUM_DIV
+    auto numElements = 1;
+    for (auto dim : xShapeVec)
+      numElements *= static_cast<int32_t>(dim);
+    auto rDenominator = ScalarConst(rewriter, op.getLoc(), 1.0f / numElements);
+    auto sum = rewriter.create<mlir::TFL::SumOp>(
+        op.getLoc(), resultType, x, op.getOperand(1), keepDims);
+    auto mean = rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(
+        op, resultType, sum, rDenominator, "NONE");
+    return mlir::success();
+#elif defined(MEAN_SUM_DIV_REPEAT)
+    std::sort(axis.begin(), axis.end());
+
+    auto curMean = x;
+    auto diff = 0;
+    auto reduceDim = false;
+    for (auto cur : axis) {
+      if (cur == 0) {
+        reduceDim = true;
+        continue;
+      }
+
+      cur -= diff;
+      auto curAxisAttr = rewriter.getI32TensorAttr({cur});
+      auto curDenom = xShapeVec[cur];
+      if (keepDims) {
+        xShapeVec[cur] = 1;
+      } else {
+        xShapeVec.erase(xShapeVec.begin() + cur);
+        ++diff;
+      }
+      auto curShape = mlir::RankedTensorType::get(
+          xShapeVec, xType.getElementType());
+      auto curAxis = rewriter.create<mlir::TFL::ConstOp>(
+          op.getLoc(), curAxisAttr.getType(), curAxisAttr);
+      auto curSum = rewriter.create<mlir::TFL::SumOp>(
+          op.getLoc(), curShape, curMean, curAxis, keepDims);
+      auto curRDenom = ScalarConst(rewriter, op.getLoc(), 1.0f / curDenom);
+      curMean = rewriter.create<mlir::TFL::MulOp>(
+          op.getLoc(), curShape, curSum, curRDenom, "NONE");
+    }
+
+    if (reduceDim && !keepDims) {
+      xShapeVec.erase(xShapeVec.begin());
+      curMean = Reshape(
+          rewriter, op.getLoc(), curMean,
+          curMean.getType().dyn_cast<mlir::ShapedType>(), xShapeVec);
+    }
+    rewriter.replaceOp(op, {curMean});
+
+    return mlir::success();
+#elif defined(MEAN_ONE_AXIS)
+    std::sort(axis.begin(), axis.end());
+
+    auto curMean = x;
+    auto diff = 0;
+    auto reduceDim = false;
+    for (auto cur : axis) {
+      if (cur == 0) {
+        reduceDim = true;
+        continue;
+      }
+
+      cur -= diff;
+      auto curAxisAttr = rewriter.getI32TensorAttr({cur});
+      if (keepDims) {
+        xShapeVec[cur] = 1;
+      } else {
+        xShapeVec.erase(xShapeVec.begin() + cur);
+        ++diff;
+      }
+      auto curShape = mlir::RankedTensorType::get(
+          xShapeVec, xType.getElementType());
+      auto curAxis = rewriter.create<mlir::TFL::ConstOp>(
+          op.getLoc(), curAxisAttr.getType(), curAxisAttr);
+      curMean = rewriter.create<mlir::TFL::MeanOp>(
+          op.getLoc(), curShape, curMean, curAxis, keepDims);
+    }
+
+    if (reduceDim && !keepDims) {
+      xShapeVec.erase(xShapeVec.begin());
+      curMean = Reshape(
+          rewriter, op.getLoc(), curMean,
+          curMean.getType().dyn_cast<mlir::ShapedType>(), xShapeVec);
+    }
+    rewriter.replaceOp(op, {curMean});
+
+    return mlir::success();
+#elif defined(MEAN_RESHAPE)
+    // Reshape method only works when the reduce axes are bunched together
+    auto newShapeVec = std::vector<int64_t>();
+    auto firstAxis = *axisElementsAttr.getValues<int32_t>().begin();
+    for (auto i = 0; i < firstAxis; ++i)
+      newShapeVec.push_back(xShapeVec[i]);
+    auto prevDim = firstAxis - 1;
+    auto reduceNumElements = 1;
+    auto numAxesReduced = 0;
+    for (auto dim : axisElementsAttr.getValues<int32_t>()) {
+      // DEBUG
+      llvm::dbgs() << "Reduce axis " << dim << "\n";
+
+      if (dim != prevDim + 1)
+        return mlir::failure();
+      prevDim = dim;
+      reduceNumElements *= xShapeVec[dim];
+      ++numAxesReduced;
+    }
+    if (keepDims) {
+      for (int i = 1; i < numAxesReduced; ++i)
+        newShapeVec.push_back(1);
+    }
+    newShapeVec.push_back(reduceNumElements);
+    for (auto i = prevDim + 1; i < xShapeVec.size(); ++i)
+      newShapeVec.push_back(xShapeVec[i]);
+
+    // DEBUG
+    llvm::dbgs() << "xType: ";
+    xType.dump();
+    llvm::dbgs() << "\nnewShapeVec: [";
+    for (auto i = 0; i < newShapeVec.size(); ++i) {
+      if (i != 0)
+        llvm::dbgs() << ", ";
+      llvm::dbgs() << newShapeVec[i];
+    }
+    llvm::dbgs() << "]\n";
+
+    auto reshapedX = Reshape(rewriter, op.getLoc(), x, xType, newShapeVec);
+
+    // DEBUG
+    llvm::dbgs() << "Reshaped x: ";
+    reshapedX.dump();
+
+    auto newAxisValue = keepDims ? firstAxis + numAxesReduced - 1 : firstAxis;
+    auto newAxisAttr = rewriter.getI32TensorAttr({newAxisValue});
+    auto newAxis = rewriter.create<mlir::TFL::ConstOp>(
+        op.getLoc(), newAxisAttr.getType(), newAxisAttr);
+
+    // DEBUG
+    llvm::dbgs() << "New axis: ";
+    newAxis.dump();
+
+    auto result = rewriter.replaceOpWithNewOp<mlir::TFL::MeanOp>(
+        op, resultType, reshapedX, newAxis, keepDims);
+
+    // DEBUG
+    llvm::dbgs() << "Result: ";
+    result.dump();
+
+    return mlir::success();
+#endif
+  }
+
+  return mlir::failure();
+}
+
+ReplaceSquaredDifferenceOp::ReplaceSquaredDifferenceOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::SquaredDifferenceOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceSquaredDifferenceOp::matchAndRewrite(
+    mlir::TFL::SquaredDifferenceOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: SquaredDifferenceOp is called!\n";
+
+  auto x = op.getOperand(0);
+  auto y = op.getOperand(1);
+  auto diff = rewriter.create<mlir::TFL::SubOp>(
+      op.getLoc(), x.getType(), x, y, "NONE");
+  rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(
+      op, x.getType(), diff, diff, "NONE");
+
+  return mlir::success();
+}
+
+ReplaceNegOp::ReplaceNegOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::NegOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceNegOp::matchAndRewrite(
+    mlir::TFL::NegOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: NegOp is called!\n";
+
+  auto x = op.getOperand();
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+
+  auto constShape = std::vector<int64_t>();
+  auto constType = xType.clone(constShape);
+  auto zeroAttr = mlir::SplatElementsAttr::get(constType, 0);
+  auto zero = rewriter.create<mlir::TFL::ConstOp>(
+      op.getLoc(), zeroAttr.getType(), zeroAttr);
+
+  rewriter.replaceOpWithNewOp<mlir::TFL::SubOp>(
+      op, xType, zero, x, "NONE");
+
+  return mlir::success();
+}
+
+ReplaceResizeNearestNeighbor::ReplaceResizeNearestNeighbor(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::ResizeNearestNeighborOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceResizeNearestNeighbor::matchAndRewrite(
+    mlir::TFL::ResizeNearestNeighborOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: ResizeNearestNeighbor is called!\n";
+
+  auto x = op.getOperand(0);
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+  auto xShapeVec = xType.getShape().vec();
+  auto resultType = op.getResult().getType().dyn_cast<mlir::ShapedType>();
+  auto resultShapeVec = resultType.getShape().vec();
+  auto evenDim = false;
+  if (xShapeVec.size() >= 3)
+    evenDim = (xShapeVec[1] % 2 == 0) && (xShapeVec[2] % 2 == 0);
+  auto xNumElements = static_cast<int64_t>(1);
+  for (auto dim : xShapeVec)
+    xNumElements *= dim;
+
+  // DEBUG
+  llvm::dbgs() << "Even dim: " << evenDim << "\n";
+  llvm::dbgs() << "xNumElements: " << xNumElements << "\n";
+
+  // Choosing the value 1228800 because this pass was originally written for a
+  // text detection model, and only one of the ResizeNearestNeighbor operations
+  // couldn't be mapped to the TPU, and the input of that operation had size
+  // (1, 60, 80, 256)
+  if (evenDim && xShapeVec.size() == 4 && xNumElements >= 1228800) {
+    auto subXShapeVec = xShapeVec;
+    subXShapeVec[1] /= 2;
+    subXShapeVec[2] /= 2;
+
+    auto xSizeVec = std::vector<int32_t>{
+        static_cast<int32_t>(xShapeVec[1]),
+        static_cast<int32_t>(xShapeVec[2])
+    };
+    auto xSizeAttr = rewriter.getI32TensorAttr(xSizeVec);
+    auto xSize = rewriter.create<mlir::TFL::ConstOp>(
+        op.getLoc(), xSizeAttr.getType(), xSizeAttr);
+
+    auto resizedXs = std::vector<mlir::Value>();
+    auto halfH = subXShapeVec[1];
+    auto halfW = subXShapeVec[2];
+    for (auto h = static_cast<int64_t>(0); h < xShapeVec[1]; h += halfH) {
+      for (auto w = static_cast<int64_t>(0); w < xShapeVec[1]; w += halfW) {
+        auto subX = StridedSlice(
+            rewriter, op.getLoc(), x, xType, subXShapeVec,
+            {
+                0,
+                static_cast<int32_t>(h),
+                static_cast<int32_t>(w),
+                0
+            },
+            {
+                static_cast<int32_t>(xShapeVec[0]),
+                static_cast<int32_t>(h + halfH),
+                static_cast<int32_t>(w + halfW),
+                static_cast<int32_t>(xShapeVec[3])
+            },
+            {1, 1, 1, 1});
+
+        // DEBUG
+        subX.dump();
+
+        auto resizedX = rewriter.create<mlir::TFL::ResizeNearestNeighborOp>(
+            op.getLoc(), xType, subX, xSize, false);
+
+        // DEBUG
+        resizedX.dump();
+
+        resizedXs.push_back(resizedX);
+      }
+    }
+
+    auto top = Concat(
+        rewriter, op.getLoc(), {resizedXs[0], resizedXs[1]}, 2);
+    auto bottom = Concat(
+        rewriter, op.getLoc(), {resizedXs[2], resizedXs[3]}, 2);
+    auto result = Concat(
+        rewriter, op.getLoc(), {top, bottom}, 1);
+    rewriter.replaceOp(op, {result});
+
+    return mlir::success();
+  }
+
+  return mlir::failure();
+}
+
+ReplaceResizeBilinear::ReplaceResizeBilinear(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::ResizeBilinearOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceResizeBilinear::matchAndRewrite(
+    mlir::TFL::ResizeBilinearOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: ResizeBilinear is called!\n";
+
+  // TODO: combine with ResizeNearestNeighbor using templates
+
+  auto x = op.getOperand(0);
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+  auto xShapeVec = xType.getShape().vec();
+  auto resultType = op.getResult().getType().dyn_cast<mlir::ShapedType>();
+  auto resultShapeVec = resultType.getShape().vec();
+  auto evenDim = false;
+  if (xShapeVec.size() >= 3)
+    evenDim = (xShapeVec[1] % 2 == 0) && (xShapeVec[2] % 2 == 0);
+  auto xNumElements = static_cast<int64_t>(1);
+  // DEBUG
+  llvm::dbgs() << "Shape:";
+  for (auto dim : xShapeVec) {
+    xNumElements *= dim;
+
+    llvm::dbgs() << " " << dim;
+  }
+  llvm::dbgs() << "\n";
+
+  // DEBUG
+  llvm::dbgs() << "Even dim: " << evenDim << "\n";
+  llvm::dbgs() << "xNumElements: " << xNumElements << "\n";
+
+  // Choosing the value 1048576 because this pass was originally written for
+  // U2-net, and only one of the ResizeBilinear operations
+  // couldn't be mapped to the TPU, and the input of that operation had size
+  // (1, 128, 128, 64)
+  if (evenDim && xShapeVec.size() == 4 && xNumElements >= 1048576) {
+    // Old method: split image
+    /*
+    // The larger U2-net (320x320) has to be split into 8 parts to be mapped to
+    // the TPU, while the smaller U2-net (256x256) only has to be split into
+    // 4 parts
+    auto numSplits = std::vector<int32_t>{1, 2, 2, 1};
+    if (xNumElements >= 1638400 && xShapeVec[1] % 4 == 0)
+      numSplits = {1, 4, 2, 1};
+    */
+    // New method: split channel
+    auto numSplits = std::vector<int32_t>{1, 1, 1, 4};
+
+    auto begins = std::vector<std::vector<int32_t>>{{}};
+    auto ends = std::vector<std::vector<int32_t>>{{}};
+    auto numDims = 4;
+    auto stride = std::vector<int32_t>(numDims, 1);
+    for (auto i = 0; i < numDims; ++i) {
+      auto numSplit = numSplits[i];
+      auto dimSize = xShapeVec[i];
+      auto size = dimSize / numSplit;
+      auto curBegins = decltype(begins)();
+      auto curEnds = decltype(ends)();
+      for (auto j = 0; j < begins.size(); ++j) {
+        for (auto k = 0; k < numSplit; ++k) {
+          auto begin = begins[j];
+          auto end = ends[j];
+          begin.push_back(k * size);
+          curBegins.push_back(begin);
+          end.push_back((k + 1) * size);
+          curEnds.push_back(end);
+
+          // DEBUG
+          llvm::dbgs() << "axis: " << i << ", numSplit: " << numSplit << ", "
+                       << "begin: ( ";
+          for (auto a : begin)
+            llvm::dbgs() << a << " ";
+          llvm::dbgs() << "), end: ( ";
+          for (auto a : end)
+            llvm::dbgs() << a << " ";
+          llvm::dbgs() << ")\n";
+        }
+      }
+      begins = std::move(curBegins);
+      ends = std::move(curEnds);
+    }
+    // DEBUG
+    for (auto i = 0; i < begins.size(); ++i) {
+      llvm::dbgs() << "i: " << i << ", begin ( ";
+      for (auto j : begins[i])
+        llvm::dbgs() << j << " ";
+      llvm::dbgs() << "), end ( ";
+      for (auto j : ends[i])
+        llvm::dbgs() << j << " ";
+      llvm::dbgs() << ")\n";
+    }
+
+    auto subXShapeVec = xShapeVec;
+    auto resizedXShapeVec = resultShapeVec;
+    for (auto i = 0; i < numDims; ++i) {
+      subXShapeVec[i] /= numSplits[i];
+      resizedXShapeVec[i] /= numSplits[i];
+    }
+
+    auto xSizeVec = std::vector<int32_t>{
+        static_cast<int32_t>(resizedXShapeVec[1]),
+        static_cast<int32_t>(resizedXShapeVec[2])
+    };
+    auto xSizeAttr = rewriter.getI32TensorAttr(xSizeVec);
+    auto xSize = rewriter.create<mlir::TFL::ConstOp>(
+        op.getLoc(), xSizeAttr.getType(), xSizeAttr);
+    auto resizedXType = xType.clone(resizedXShapeVec);
+
+    auto resizedXs = std::vector<mlir::Value>();
+    for (auto i = 0; i < begins.size(); ++i) {
+      auto subX = StridedSlice(
+          rewriter, op.getLoc(), x, xType, subXShapeVec,
+          begins[i], ends[i], stride);
+
+      // DEBUG
+      llvm::dbgs() << "subX: ";
+      subX.dump();
+
+      auto resizedX = rewriter.create<mlir::TFL::ResizeBilinearOp>(
+          op.getLoc(), resizedXType, subX, xSize, false);
+
+      // DEBUG
+      llvm::dbgs() << "resizedX: ";
+      resizedX.dump();
+
+      resizedXs.push_back(resizedX);
+    }
+
+    for (auto i = numDims - 1; i >= 0; --i) {
+      auto numSplit = numSplits[i];
+      if (numSplit == 1)
+        continue;
+      auto dimSize = xShapeVec[i];
+      auto curResizedXs = decltype(resizedXs)();
+      for (auto j = 0; j < resizedXs.size(); j += numSplit) {
+        auto concatXs = std::vector<mlir::Value>(
+            resizedXs.begin() + j, resizedXs.begin() + j + numSplit);
+        auto curResizedX = Concat(rewriter, op.getLoc(), concatXs, i);
+
+        // DEBUG
+        llvm::dbgs() << "curResizedX: ";
+        curResizedX.dump();
+
+        curResizedXs.push_back(curResizedX);
+      }
+      resizedXs = std::move(curResizedXs);
+    }
+
+    // DEBUG
+    llvm::dbgs() << "number of resized xs left: " << resizedXs.size() << "\n";
+
+    rewriter.replaceOp(op, resizedXs);
+
+    return mlir::success();
+  }
+
+  return mlir::failure();
+}
+
+ReplaceHardSwishOp::ReplaceHardSwishOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::HardSwishOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceHardSwishOp::matchAndRewrite(
+    mlir::TFL::HardSwishOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: HardSwishOp is called!\n";
+
+  auto x = op.getOperand();
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+
+  auto constShape = std::vector<int64_t>();
+  auto constType = xType.clone(constShape);
+  auto threeVal = static_cast<float>(3);
+  auto threeAttr = mlir::SplatElementsAttr::get(constType, threeVal);
+  auto three = rewriter.create<mlir::TFL::ConstOp>(
+      op.getLoc(), threeAttr.getType(), threeAttr);
+  auto relu6XPlusThree = rewriter.create<mlir::TFL::AddOp>(
+      op.getLoc(), xType, x, three, "RELU6");
+
+  auto y = rewriter.create<mlir::TFL::MulOp>(
+      op.getLoc(), xType, x, relu6XPlusThree, "NONE");
+
+  auto oneSixthVal = static_cast<float>(1) / 6;
+  auto oneSixthAttr = mlir::SplatElementsAttr::get(constType, oneSixthVal);
+  auto oneSixth = rewriter.create<mlir::TFL::ConstOp>(
+      op.getLoc(), oneSixthAttr.getType(), oneSixthAttr);
+  rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(
+      op, xType, y, oneSixth, "NONE");
+
+  return mlir::success();
+}
+
+ReplaceDivOp::ReplaceDivOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::DivOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceDivOp::matchAndRewrite(
+    mlir::TFL::DivOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: DivOp is called!\n";
+
+  auto x = op.getOperand(0);
+  auto y = op.getOperand(1);
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+
+  auto ySq = rewriter.create<mlir::TFL::MulOp>(
+      op.getLoc(), xType, y, y, "NONE");
+  auto rAbsY = rewriter.create<mlir::TFL::RsqrtOp>(
+      op.getLoc(), xType, ySq);
+  auto rAbsY2 = rewriter.create<mlir::TFL::MulOp>(
+      op.getLoc(), xType, rAbsY, rAbsY, "NONE");
+  auto xy = rewriter.create<mlir::TFL::MulOp>(
+      op.getLoc(), xType, x, y, "NONE");
+  rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(op, xType, xy, rAbsY2, "NONE");
+
+  return mlir::success();
+}
+
+ReplaceSumOp::ReplaceSumOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::SumOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceSumOp::matchAndRewrite(
+    mlir::TFL::SumOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: SumOp is called!\n";
+
+  auto x = op.getOperand(0);
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+  auto xShapeVec = xType.getShape().vec();
+  auto keepDims = op->getAttrOfType<mlir::BoolAttr>(
+      "keep_dims").getValue();
+
+  // DEBUG
+  llvm::dbgs() << "xType: ";
+  xType.dump();
+  llvm::dbgs() << "\n";
+  llvm::dbgs() << "result type: ";
+  op->getResult(0).getType().dump();
+  llvm::dbgs() << "\n";
+
+  auto axisAttr = op.getOperand(1).getDefiningOp()->getAttr("value");
+  auto axisElementsAttr = axisAttr.dyn_cast<mlir::ElementsAttr>();
+  auto axis = std::vector<int32_t>();
+  for (auto x : axisElementsAttr.getValues<int32_t>())
+    axis.push_back(x);
+
+  // DEBUG
+  llvm::dbgs() << "axisAttr: ";
+  axisAttr.dump();
+  llvm::dbgs() << "\n";
+
+  if (xShapeVec.front() == 1 && axis.size() > 1) {
+    std::sort(axis.begin(), axis.end());
+
+    auto curSum = x;
+    auto diff = 0;
+    auto reduceDim = false;
+    for (auto cur : axis) {
+      if (cur == 0) {
+        reduceDim = true;
+        continue;
+      }
+
+      cur -= diff;
+      auto curAxisAttr = rewriter.getI32TensorAttr({cur});
+      if (keepDims) {
+        xShapeVec[cur] = 1;
+      } else {
+        xShapeVec.erase(xShapeVec.begin() + cur);
+        ++diff;
+      }
+      auto curShape = mlir::RankedTensorType::get(
+          xShapeVec, xType.getElementType());
+      auto curAxis = rewriter.create<mlir::TFL::ConstOp>(
+          op.getLoc(), curAxisAttr.getType(), curAxisAttr);
+
+      // DEBUG
+      llvm::dbgs() << "curAxis: ";
+      curAxis.dump();
+
+      curSum = rewriter.create<mlir::TFL::SumOp>(
+          op.getLoc(), curShape, curSum, curAxis, keepDims);
+
+      // DEBUG
+      llvm::dbgs() << "curSum: ";
+      curSum.dump();
+    }
+
+    if (reduceDim && !keepDims) {
+      xShapeVec.erase(xShapeVec.begin());
+      curSum = Reshape(
+          rewriter, op.getLoc(), curSum,
+          curSum.getType().dyn_cast<mlir::ShapedType>(), xShapeVec);
+
+      // DEBUG
+      llvm::dbgs() << "reshaped curSum: ";
+      curSum.dump();
+    }
+    rewriter.replaceOp(op, {curSum});
+
+
+    return mlir::success();
+  }
+
+  return mlir::failure();
+}
+
+ReplaceExpSum::ReplaceExpSum(
+    mlir::MLIRContext *ctx, mlir::PatternBenefit benefit)
+    : mlir::RewritePattern(
+    mlir::TFL::MulOp::getOperationName(), benefit, ctx) {}
+
+mlir::LogicalResult ReplaceExpSum::match(mlir::Operation *op) const {
+  auto activation = op->getAttrOfType<mlir::StringAttr>(
+      "fused_activation_function").getValue();
+  if (activation != "NONE")
+    return mlir::failure();
+  auto expOp = op->getOperand(0).getDefiningOp();
+  if (!expOp)
+    return mlir::failure();
+  if (!mlir::isa<mlir::TFL::ExpOp>(expOp))
+    return mlir::failure();
+  auto powOp = op->getOperand(1).getDefiningOp();
+  if (!powOp)
+    return mlir::failure();
+  if (!mlir::isa<mlir::TFL::PowOp>(powOp))
+    return mlir::failure();
+  auto sumOp = powOp->getOperand(0).getDefiningOp();
+  if (!sumOp)
+    return mlir::failure();
+  if (!mlir::isa<mlir::TFL::SumOp>(sumOp))
+    return mlir::failure();
+  auto negOneOp = powOp->getOperand(1).getDefiningOp();
+  if (!negOneOp)
+    return mlir::failure();
+  if (!mlir::isa<mlir::ConstantOp>(negOneOp))
+    return mlir::failure();
+  auto negOneAttr = negOneOp->getAttrOfType<mlir::ElementsAttr>("value");
+  auto negOne = *negOneAttr.getValues<float>().begin();
+  if (negOne != -1)
+    return mlir::failure();
+  if (sumOp->getOperand(0).getDefiningOp() != expOp)
+    return mlir::failure();
+  return mlir::success();
+}
+
+void ReplaceExpSum::rewrite(
+    mlir::Operation *op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: ReplaceExpSum is called!\n";
+
+  auto expOp = op->getOperand(0).getDefiningOp();
+  auto x = expOp->getOperand(0);
+  auto resultType = op->getResult(0).getType();
+  auto beta = static_cast<float>(1);
+  rewriter.replaceOpWithNewOp<mlir::TFL::SoftmaxOp>(
+      op, resultType, x, llvm::APFloat(beta));
+}
+
+ReplaceMaxPool2DOp::ReplaceMaxPool2DOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::MaxPool2DOp>(ctx) {}
+
+mlir::LogicalResult ReplaceMaxPool2DOp::matchAndRewrite(
+    mlir::TFL::MaxPool2DOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: MaxPool2DOp is called!\n";
+
+  auto x = op.getOperand();
+  auto resultType = op->getResult(0).getType();
+  auto maxpool = rewriter.create<mlir::TFL::MaxPool2DOp>(
+      op.getLoc(), resultType, x,
+      op->getAttrOfType<mlir::StringAttr>("padding"),
+      op->getAttrOfType<mlir::IntegerAttr>("stride_w"),
+      op->getAttrOfType<mlir::IntegerAttr>("stride_h"),
+      op->getAttrOfType<mlir::IntegerAttr>("filter_width"),
+      op->getAttrOfType<mlir::IntegerAttr>("filter_height"),
+      rewriter.getStringAttr("NONE"));
+  auto activation = op->getAttrOfType<mlir::StringAttr>(
+      "fused_activation_function").getValue();
+  if (activation == "RELU") {
+    rewriter.replaceOpWithNewOp<mlir::TFL::ReluOp>(op, resultType, maxpool);
+    return mlir::success();
+  }
+  return mlir::failure();
+}
+
+ReplaceAveragePool2DOp::ReplaceAveragePool2DOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::AveragePool2DOp>(ctx) {}
+
+mlir::LogicalResult ReplaceAveragePool2DOp::matchAndRewrite(
+    mlir::TFL::AveragePool2DOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: AveragePool2DOp is called!\n";
+
+  auto x = op.getOperand();
+  auto resultType = op->getResult(0).getType();
+
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+  auto xShapeVec = xType.getShape().vec();
+  auto filterW = op->getAttrOfType<mlir::IntegerAttr>(
+      "filter_width").getInt();
+  auto filterH = op->getAttrOfType<mlir::IntegerAttr>(
+      "filter_height").getInt();
+  auto xNumElements = 1;
+  for (auto dimSize : xShapeVec)
+    xNumElements *= dimSize;
+
+  // DEBUG
+  llvm::dbgs() << "Input width: " << xShapeVec[2] << "\n";
+  llvm::dbgs() << "Input height: " << xShapeVec[1] << "\n";
+  llvm::dbgs() << "Filter width: " << filterW << "\n";
+  llvm::dbgs() << "Input height: " << filterH << "\n";
+  llvm::dbgs() << "Input num elements: " << xNumElements << "\n";
+
+  if (filterH == xShapeVec[1] && filterW == xShapeVec[2] &&
+      xNumElements >= 147456) {
+    auto axisAttr = rewriter.getI32TensorAttr({1, 2});
+    auto axis = rewriter.create<mlir::TFL::ConstOp>(
+        op.getLoc(), axisAttr.getType(), axisAttr);
+    auto mean = rewriter.create<mlir::TFL::MeanOp>(
+        op.getLoc(), resultType, x, axis, true);
+
+    auto activation = op->getAttrOfType<mlir::StringAttr>(
+        "fused_activation_function").getValue();
+    if (activation == "RELU") {
+      rewriter.replaceOpWithNewOp<mlir::TFL::ReluOp>(op, resultType, mean);
+      return mlir::success();
+    } else if (activation == "NONE") {
+      rewriter.replaceOp(op, {mean});
+      return mlir::success();
+    }
+    return mlir::failure();
+  }
+  return mlir::failure();
+}
+
+ReplaceReshapeOp::ReplaceReshapeOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::ReshapeOp>(ctx) {}
+
+mlir::LogicalResult ReplaceReshapeOp::matchAndRewrite(
+    mlir::TFL::ReshapeOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: ReshapeOp is called!\n";
+
+  auto x = op.getOperand(0);
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+  auto xShapeVec = xType.getShape().vec();
+  auto resultType = op->getResult(0).getType().dyn_cast<mlir::ShapedType>();
+  auto resultShapeVec = resultType.getShape().vec();
+
+  auto xNumElements = 1;
+  for (auto dimSize : xShapeVec)
+    xNumElements *= dimSize;
+  // This split and reshape only works when multiple axes are reshaped into one
+  if (xNumElements >= 73728 &&
+      xShapeVec.size() == 4 &&
+      resultShapeVec.size() == 2 &&
+      resultShapeVec[0] == xShapeVec[1] * xShapeVec[2] &&
+      resultShapeVec[1] == xShapeVec[3]) {
+    auto splits = std::vector<mlir::Value>();
+    auto numSplits = 2;
+    auto splitSize = static_cast<int32_t>(xShapeVec[1] / numSplits);
+    for (auto i = 0; i < numSplits; ++i) {
+      auto split = StridedSlice(
+          rewriter, op.getLoc(), x, xType,
+          {
+              xShapeVec[0],
+              splitSize,
+              xShapeVec[2],
+              xShapeVec[3]
+          },
+          {0, i * splitSize, 0, 0},
+          {
+              static_cast<int32_t>(xShapeVec[0]),
+              (i + 1) * splitSize,
+              static_cast<int32_t>(xShapeVec[2]),
+              static_cast<int32_t>(xShapeVec[3])
+          },
+          {1, 1, 1, 1}
+      );
+      auto reshapedSplit = Reshape(
+          rewriter, op.getLoc(), split,
+          split.getType().dyn_cast<mlir::ShapedType>(),
+          {
+              resultShapeVec[0] / numSplits,
+              static_cast<int32_t>(resultShapeVec[1])
+          });
+      splits.push_back(reshapedSplit);
+    }
+
+    auto result = Concat(rewriter, op.getLoc(), splits, 0);
+    rewriter.replaceOp(op, {result});
+
+    return mlir::success();
+  }
+  return mlir::failure();
+}
+
+#define MY_TFL_PASS
+void AllTFLPasses::runOnOperation() {
+  auto ctx = &getContext();
+  mlir::RewritePatternSet patterns(ctx);
+  patterns.insert(std::make_unique<ReplaceAbsOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceLeakyReluOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceTileOp>(ctx));
+#ifdef UNPACK_TFL
+  patterns.insert(std::make_unique<ReplaceTFLUnpackOp>(ctx));
+#endif
+#ifndef EXP_DISABLE
+  patterns.insert(std::make_unique<ReplaceExpOp>(ctx));
+#endif
+#ifndef LOG_DISABLE
+  patterns.insert(std::make_unique<ReplaceLogOp>(ctx));
+#endif
+  patterns.insert(std::make_unique<ReplaceFullyConnectedOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceSplitOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceMeanOp>(ctx));
+#ifdef SQUARED_DIFFERENCE_OLD
+  patterns.insert(std::make_unique<ReplaceSquaredDifferenceOp>(ctx));
+#endif
+  patterns.insert(std::make_unique<ReplaceNegOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceResizeNearestNeighbor>(ctx));
+  // DEBUG
+  patterns.insert(std::make_unique<ReplaceResizeBilinear>(ctx));
+  patterns.insert(std::make_unique<ReplaceHardSwishOp>(ctx));
+  // DEBUG
+  patterns.insert(std::make_unique<ReplaceDivOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceSumOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceExpSum>(ctx));
+  patterns.insert(std::make_unique<ReplaceMaxPool2DOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceAveragePool2DOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceReshapeOp>(ctx));
+
+  mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+}
+
+#define SOFTPLUS_RELU
+ReplaceSoftplusOp::ReplaceSoftplusOp(mlir::MLIRContext *ctx,
+                                     const std::string &savedModelPath)
+    : mlir::OpRewritePattern<mlir::TF::SoftplusOp>(ctx, /*benefit=*/1),
+      calibrationData_(savedModelPath, "Softplus_calibration.txt") {}
+
+mlir::LogicalResult ReplaceSoftplusOp::matchAndRewrite(
+    mlir::TF::SoftplusOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: SoftplusOp is called!\n";
+
+#ifdef SOFTPLUS_X
+  rewriter.replaceOp(op, {op.getOperand()});
+#endif
+
+#ifdef SOFTPLUS_RELU
+  rewriter.replaceOpWithNewOp<mlir::TF::ReluOp>(op, op.getOperand());
+#endif
+
+#ifdef SOFTPLUS_LINE_SEGMENTS
+  const float a = -1.7, b = 1.5, m = b / (b - a), n = 1 - m;
+
+  auto x = op.getOperand();
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+  // TODO: check out broadcasting
+  auto aAttr = mlir::SplatElementsAttr::get(xType, a);
+  auto aConst = rewriter.create<mlir::TF::ConstOp>(
+      op.getLoc(), aAttr.getType(), aAttr);
+  auto xSuba = rewriter.create<mlir::TF::SubOp>(op.getLoc(), x, aConst);
+  auto relu1 = rewriter.create<mlir::TF::ReluOp>(op.getLoc(), xSuba);
+  auto mAttr = mlir::SplatElementsAttr::get(xType, m);
+  auto mConst = rewriter.create<mlir::TF::ConstOp>(
+      op.getLoc(), mAttr.getType(), mAttr);
+  auto part1 = rewriter.create<mlir::TF::MulOp>(op.getLoc(), mConst, relu1);
+
+  auto bAttr = mlir::SplatElementsAttr::get(xType, b);
+  auto bConst = rewriter.create<mlir::TF::ConstOp>(
+      op.getLoc(), bAttr.getType(), bAttr);
+  auto xSubb = rewriter.create<mlir::TF::SubOp>(op.getLoc(), x, bConst);
+  auto relu2 = rewriter.create<mlir::TF::ReluOp>(op.getLoc(), xSubb);
+  auto nAttr = mlir::SplatElementsAttr::get(xType, n);
+  auto nConst = rewriter.create<mlir::TF::ConstOp>(
+      op.getLoc(), nAttr.getType(), nAttr);
+  auto part2 = rewriter.create<mlir::TF::MulOp>(op.getLoc(), nConst, relu2);
+
+  rewriter.replaceOpWithNewOp<mlir::TF::AddOp>(op, part1, part2);
+#endif
+
+#if defined(SOFTPLUS_LEAST_SQ) || defined(SOFTPLUS_REL_LEAST_SQ) || \
+    defined(SOFTPLUS_MINIMAX) || defined(SOFTPLUS_TAYLOR)
+  auto x = op.getOperand();
+  float coeffs[20];
+
+#ifdef SOFTPLUS_LEAST_SQ
+  int degree = 3;
+  calibrationData_.getPolyCoeff(
+      op.getLoc(), "softplus", "least_square", degree, coeffs);
+#endif
+#ifdef SOFTPLUS_REL_LEAST_SQ
+  int degree = 3;
+  calibrationData_.getPolyCoeff(
+      op.getLoc(), "softplus", "relative_least_square", degree, coeffs);
+#endif
+#ifdef SOFTPLUS_MINIMAX
+  int degree = 3;
+  calibrationData_.getPolyCoeff(
+      op.getLoc(), "softplus", "minimax", degree, coeffs);
+#endif
+#ifdef SOFTPLUS_TAYLOR
+  int degree = 3;
+  calibrationData_.getPolyCoeff(
+      op.getLoc(), "softplus", "taylor", degree, coeffs);
+#endif
+  auto sum = PolynomialValueTF(rewriter, op.getLoc(), x, coeffs, degree);
+  rewriter.replaceOp(op, {sum});
+#endif
+
+  return mlir::success();
+}
+
+ReplaceTFUnpackOp::ReplaceTFUnpackOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TF::UnpackOp>(ctx, /*benefit=*/1) {}
+
+mlir::LogicalResult ReplaceTFUnpackOp::matchAndRewrite(
+    mlir::TF::UnpackOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: UnpackOp is called!\n";
+
+  auto x = op.getOperand();
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+  auto axisAttr = op->getAttr("axis").dyn_cast<mlir::IntegerAttr>();
+  auto axis = axisAttr.getInt();
+  auto num = xType.getShape()[axis];
+
+  // DEBUG
+  llvm::dbgs() << "num = " << num << ", axis = " << axis << "\n";
+
+  auto size = static_cast<int64_t>(xType.getShape().size());
+  auto stridedSliceInputShape = llvm::ArrayRef<int64_t>(size);
+  auto stridedSliceInputType = mlir::RankedTensorType::get(
+      stridedSliceInputShape, rewriter.getI32Type());
+  auto strideAttr = mlir::SplatElementsAttr::get(stridedSliceInputType, 1);
+  auto strideConst = rewriter.create<mlir::TF::ConstOp>(
+      op.getLoc(), strideAttr.getType(), strideAttr);
+
+  // DEBUG
+  llvm::dbgs() << "strides: ";
+  strideConst.dump();
+  llvm::dbgs() << "\n";
+
+  auto slicedXShape = xType.getShape().vec();
+  slicedXShape.erase(slicedXShape.begin() + axis);
+  auto slicedXType =
+      mlir::RankedTensorType::get(slicedXShape, xType.getElementType());
+
+  auto ui64Type = mlir::IntegerType::get(rewriter.getContext(), 64);
+  auto zerosMask = rewriter.getIntegerAttr(ui64Type, 0);
+  auto shrinkAxisMask = rewriter.getIntegerAttr(ui64Type, 1 << axis);
+
+  std::vector<mlir::Value> slicedXs;
+  slicedXs.reserve(num);
+  for (long i = 0; i < num; ++i) {
+    auto beginVals = std::vector<int32_t>(xType.getShape().size(), 0);
+    beginVals[axis] = i;
+    auto beginAttr = rewriter.getI32TensorAttr(beginVals);
+    auto beginConst = rewriter.create<mlir::TF::ConstOp>(
+        op.getLoc(), beginAttr.getType(), beginAttr);
+
+    // DEBUG
+    llvm::dbgs() << "begin: ";
+    beginConst.dump();
+    llvm::dbgs() << "\n";
+
+    // TODO: check if the vector can be reused
+    auto endVals = std::vector<int32_t>();
+    endVals.reserve(xType.getShape().size());
+    for (auto dim : xType.getShape())
+      endVals.push_back(static_cast<int32_t>(dim));
+    endVals[axis] = i + 1;
+    auto endAttr = rewriter.getI32TensorAttr(endVals);
+    auto endConst = rewriter.create<mlir::TF::ConstOp>(
+        op.getLoc(), endAttr.getType(), endAttr);
+
+    // DEBUG
+    llvm::dbgs() << "end: ";
+    endConst.dump();
+    llvm::dbgs() << "\n";
+
+    auto slicedX = rewriter.create<mlir::TF::StridedSliceOp>(
+        op.getLoc(), slicedXType, x, beginConst, endConst, strideConst,
+        zerosMask, zerosMask, zerosMask, zerosMask, shrinkAxisMask);
+
+    // DEBUG
+    llvm::dbgs() << "strided slice: ";
+    slicedX.dump();
+    llvm::dbgs() << "\n";
+
+    slicedXs.push_back(slicedX);
+  }
+
+  rewriter.replaceOp(op, slicedXs);
+
+  return mlir::success();
+}
+
+#define MY_TF_PASS
+AllTFPasses::AllTFPasses(const std::string &savedModelPath)
+    : savedModelPath_(savedModelPath) {}
+
+void AllTFPasses::runOnOperation() {
+  auto ctx = &getContext();
+  mlir::RewritePatternSet patterns(ctx);
+  patterns.insert(std::make_unique<ReplaceSoftplusOp>(
+      ctx, savedModelPath_));
+#ifdef UNPACK_TF
+  patterns.insert(std::make_unique<ReplaceTFUnpackOp>(ctx));
+#endif
+
+  // DEBUG
+  // Seems like this pass isn't enabled, which means dilated convolutions are
+  // converted into SpaceToBatchND -> Conv2D -> BatchToSpaceND, creating
+  // unsupported operations. Enabling this pass replaces it back with the
+  // original dilated convolution.
+  // patterns.insert(std::make_unique<mlir::TFL::ConvertTFDilatedConvOp<
+  //     mlir::TF::Conv2DOp>>(ctx));
+
+  mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+}
+
+mlir::Value PolynomialValueTF(
+    mlir::PatternRewriter &rewriter, const mlir::Location &loc,
+    const mlir::Value &x, float coeffs[], int degree) {
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+
+  auto constShape = std::vector<int64_t>();
+  // DEBUG
+  // auto constType = xType;
+  auto constType = xType.clone(constShape);
+
+  auto highestTermCoeffAttr = mlir::SplatElementsAttr::get(
+      constType, coeffs[degree]);
+  auto highestTermCoeff = rewriter.create<mlir::TF::ConstOp>(
+      loc, highestTermCoeffAttr.getType(), highestTermCoeffAttr);
+
+  auto sum = highestTermCoeff.getResult();
+  for (int i = degree - 1; i >= 0; --i) {
+    sum = rewriter.create<mlir::TF::MulOp>(loc, sum, x);
+    auto coeffAttr = mlir::SplatElementsAttr::get(constType, coeffs[i]);
+    auto coeff = rewriter.create<mlir::TF::ConstOp>(
+        loc, coeffAttr.getType(), coeffAttr);
+    sum = rewriter.create<mlir::TF::AddOp>(loc, sum, coeff);
+  }
+
+  return sum;
+}
+
+mlir::Value PolynomialValueTFL(
+    mlir::PatternRewriter &rewriter, const mlir::Location &loc,
+    const mlir::Value &x, float coeffs[], int degree) {
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+
+  auto constShape = std::vector<int64_t>();
+  // DEBUG
+  // auto constType = xType;
+  auto constType = xType.clone(constShape);
+
+  auto highestTermCoeffAttr = mlir::SplatElementsAttr::get(
+      constType, coeffs[degree]);
+  auto highestTermCoeff = rewriter.create<mlir::TFL::ConstOp>(
+      loc, highestTermCoeffAttr.getType(), highestTermCoeffAttr);
+
+  auto sum = highestTermCoeff.getResult();
+  auto noActivationAttr = rewriter.getStringAttr("NONE");
+  for (int i = degree - 1; i >= 0; --i) {
+    sum = rewriter.create<mlir::TFL::MulOp>(loc, sum, x, noActivationAttr);
+    auto coeffAttr = mlir::SplatElementsAttr::get(constType, coeffs[i]);
+    auto coeff = rewriter.create<mlir::TFL::ConstOp>(
+        loc, coeffAttr.getType(), coeffAttr);
+    sum = rewriter.create<mlir::TFL::AddOp>(
+        loc, sum, coeff, noActivationAttr);
+  }
+
+  return sum;
+}
+
+mlir::Value Reshape(
+    mlir::PatternRewriter &rewriter, const mlir::Location &loc,
+    const mlir::Value &x, const mlir::ShapedType &xType,
+    const std::vector<int64_t> &newXShapeVec) {
+  auto newXShape = llvm::ArrayRef<int64_t>(newXShapeVec);
+  auto newXShapeI32Vec = std::vector<int32_t>();
+  for (auto dim : newXShape)
+    newXShapeI32Vec.push_back(static_cast<int32_t>(dim));
+  auto newXShapeI32 = llvm::ArrayRef<int32_t>(newXShapeI32Vec);
+  auto newXType = mlir::RankedTensorType::get(
+      newXShape, xType.getElementType());
+  auto newXShapeRank = static_cast<int64_t>(newXShape.size());
+  auto newXShapeShape = llvm::ArrayRef<int64_t>(newXShapeRank);
+  auto newXShapeType = mlir::RankedTensorType::get(
+      newXShapeShape, rewriter.getI32Type());
+  auto newXShapeAttr = mlir::DenseElementsAttr::get(
+      newXShapeType, newXShapeI32);
+  auto newXShapeConst = rewriter.create<mlir::TFL::ConstOp>(
+      loc, newXShapeAttr.getType(), newXShapeAttr);
+  auto reshapedX = rewriter.create<mlir::TFL::ReshapeOp>(
+      loc, newXType, x, newXShapeConst);
+  return reshapedX;
+}
+
+mlir::Value StridedSlice(
+    mlir::PatternRewriter &rewriter, const mlir::Location &loc,
+    const mlir::Value &x, mlir::ShapedType xType,
+    const std::vector<int64_t> &newXShapeVec,
+    const std::vector<int32_t> &beginVec,
+    const std::vector<int32_t> &endVec,
+    const std::vector<int32_t> &stridesVec,
+    int64_t beginMask,
+    int64_t endMask,
+    int64_t ellipsisMask,
+    int64_t newAxisMask,
+    int64_t shrinkAxisMask) {
+  auto slicedType = xType.clone(newXShapeVec);
+
+  auto beginAttr = rewriter.getI32TensorAttr(beginVec);
+  auto beginConst = rewriter.create<mlir::TF::ConstOp>(
+      loc, beginAttr.getType(), beginAttr);
+
+  auto endAttr = rewriter.getI32TensorAttr(endVec);
+  auto endConst = rewriter.create<mlir::TF::ConstOp>(
+      loc, endAttr.getType(), endAttr);
+
+  auto stridesAttr = rewriter.getI32TensorAttr(stridesVec);
+  auto stridesConst = rewriter.create<mlir::TFL::ConstOp>(
+      loc, stridesAttr.getType(), stridesAttr);
+
+  auto slicedX = rewriter.create<mlir::TFL::StridedSliceOp>(
+      loc, slicedType, x, beginConst, endConst, stridesConst,
+      beginMask, endMask, ellipsisMask, newAxisMask, shrinkAxisMask);
+
+  return slicedX;
+}
+
+mlir::Value Concat(
+    mlir::PatternRewriter &rewriter, const mlir::Location &loc,
+    const std::vector<mlir::Value> &xs, uint32_t axis) {
+  auto xShapes = std::vector< std::vector<int64_t> >();
+  for (auto x : xs)
+    xShapes.push_back(x.getType().dyn_cast<mlir::ShapedType>().getShape());
+
+  auto numDims = xShapes.front().size();
+  auto concatShapeVec = xShapes.front();
+  for (int i = 0; i < numDims; ++i) {
+    if (i == axis) {
+      concatShapeVec[i] = 0;
+      for (const auto &xShape : xShapes)
+        concatShapeVec[i] += xShape[i];
+    } else {
+      auto dim = xShapes.front()[i];
+      for (int j = 1; j < xShapes.size(); ++j)
+        assert(xShapes[j][i] == dim);
+    }
+  }
+  auto xType = xs.front().getType().dyn_cast<mlir::ShapedType>();
+  auto concatType = xType.clone(concatShapeVec);
+
+  auto concatX = rewriter.create<mlir::TFL::ConcatenationOp>(
+      loc, concatType, xs, axis, "NONE");
+  return concatX;
+}
+
+mlir::Value ScalarConst(
+    mlir::PatternRewriter &rewriter, const mlir::Location &loc,
+    float constant) {
+  auto constShape = std::vector<int64_t>();
+  auto constElementType = rewriter.getF32Type();
+  auto constType = mlir::RankedTensorType::get(
+      constShape, constElementType);
+  auto constAttr = mlir::SplatElementsAttr::get(constType, constant);
+  return rewriter.create<mlir::TFL::ConstOp>(
+      loc, constAttr.getType(), constAttr);
+}
+
+#define MY_TF_PASS
+void AddMyTFPass(
+  llvm::StringRef modelDir, mlir::OpPassManager *passManager) {
+#ifdef MY_TF_PASS
+  passManager->addPass(std::make_unique<MyPass::AllTFPasses>(
+      modelDir.str()));
+#endif
+}
+
+#define MY_TFL_PASS
+void AddMyTFLPass(mlir::OpPassManager *passManager) {
+#ifdef MY_TFL_PASS
+  passManager->addPass(std::make_unique<MyPass::AllTFLPasses>());
+#endif
+}
+} // namespace MyPass
+
 namespace mlir {
 /// Create a pass to convert from the TFExecutor to the TF control dialect.
 std::unique_ptr<OperationPass<FuncOp>>
@@ -193,6 +1975,8 @@ void AddPostVariableFreezingTFToTFLConversionPasses(
   pass_manager->addPass(mlir::createInlinerPass());
   pass_manager->addPass(mlir::createSymbolDCEPass());
 
+  MyPass::AddMyTFPass(saved_model_dir, pass_manager);
+
   if (pass_config.lower_tensor_list_ops &&
       toco_flags.tf_quantization_mode().empty()) {
     // TODO(haoliang): Add this pass by default.
@@ -316,6 +2100,8 @@ void AddPostVariableFreezingTFToTFLConversionPasses(
     pass_manager->addPass(mlir::createSymbolDCEPass());
     pass_manager->addNestedPass<mlir::FuncOp>(mlir::createCanonicalizerPass());
     pass_manager->addNestedPass<mlir::FuncOp>(mlir::createCSEPass());
+
+    MyPass::AddMyTFLPass(pass_manager);
 
     // Run quantization after all the floating point model conversion is
     // completed. Add either full integer quantization or dynamic range

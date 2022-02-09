@@ -47,3 +47,7 @@ gradleBuild
 Podfile.lock
 Pods
 xcuserdata
+
+# clangd related
+**/*clangd*
+compile_commands.json
