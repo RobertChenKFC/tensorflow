@@ -452,7 +452,7 @@ class NamedObject(object):
     return self._obj(*args, **kwargs)
 
   def __iter__(self):
-    return self._obj.__iter__()
+    return self._obj.iter()
 
   def __repr__(self):
     return self._name

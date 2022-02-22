@@ -55,7 +55,7 @@ def use_wrapped_call(layer, call_fn, default_training_value=None,
   if hasattr(call_fn, 'original_layer_call'):  # call_fn is a LayerCall object
     original_call = call_fn.original_layer_call
     # In Python 3, callable objects are not compatible with inspect.getargspec
-    call_fn = call_fn.__call__
+    call_fn = call_fn.get_generator
   else:
     original_call = call_fn
   fn, arg_spec = maybe_add_training_arg(

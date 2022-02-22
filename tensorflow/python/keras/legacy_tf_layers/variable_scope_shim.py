@@ -40,7 +40,7 @@ def as_shape(shape):
 
 
 def _is_callable_object(obj):
-  return hasattr(obj, "__call__") and tf_inspect.ismethod(obj.__call__)
+  return hasattr(obj, "__call__") and tf_inspect.ismethod(obj.get_generator)
 
 
 def _has_kwargs(fn):
@@ -58,7 +58,7 @@ def _has_kwargs(fn):
   if isinstance(fn, functools.partial):
     fn = fn.func
   elif _is_callable_object(fn):
-    fn = fn.__call__
+    fn = fn.get_generator
   elif not callable(fn):
     raise TypeError(
         "fn should be a function-like object, but is of type {}.".format(
@@ -82,8 +82,8 @@ def fn_args(fn):
     args = fn_args(fn.func)
     args = [a for a in args[len(fn.args):] if a not in (fn.keywords or [])]
   else:
-    if hasattr(fn, "__call__") and tf_inspect.ismethod(fn.__call__):
-      fn = fn.__call__
+    if hasattr(fn, "__call__") and tf_inspect.ismethod(fn.get_generator):
+      fn = fn.get_generator
     args = tf_inspect.getfullargspec(fn).args
     if _is_bound_method(fn) and args:
       # If it's a bound method, it may or may not have a self/cls first

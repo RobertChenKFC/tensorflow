@@ -633,7 +633,7 @@ mlir::LogicalResult ReplaceSplitOp::matchAndRewrite(
 ReplaceMeanOp::ReplaceMeanOp(mlir::MLIRContext *ctx)
     : mlir::OpRewritePattern<mlir::TFL::MeanOp>(ctx, /*benefit=*/1) {}
 
-#define MEAN_RESHAPE
+#define MEAN_ONE_AXIS
 mlir::LogicalResult ReplaceMeanOp::matchAndRewrite(
     mlir::TFL::MeanOp op, mlir::PatternRewriter &rewriter) const {
   llvm::dbgs() << "INFO: MeanOp is called!\n";

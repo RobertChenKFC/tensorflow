@@ -266,12 +266,12 @@ def _replace_child_layer_functions(layer, serialization_cache):
   def replace_metric_functions(child_layer, serialized_fns):
     """Replaces metric functions with wrapped functions."""
     original_fns[child_layer] = {
-        '__call__': child_layer.__call__,
+        '__call__': child_layer.get_generator,
         'result': child_layer.result,
         'update_state': child_layer.update_state
     }
     with utils.no_automatic_dependency_tracking_scope(child_layer):
-      child_layer.__call__ = serialized_fns['__call__']
+      child_layer.get_generator = serialized_fns['__call__']
       child_layer.result = serialized_fns['result']
       child_layer.update_state = serialized_fns['update_state']
 
@@ -676,7 +676,7 @@ def _wrap_call_and_conditional_losses(layer):
 def _extract_outputs_from_fn(layer, call_and_return_conditional_losses):
   """Returns a function that returns only call function outputs."""
   if isinstance(layer, keras_load.RevivedLayer):
-    return layer.keras_api.__call__  # pylint: disable=protected-access
+    return layer.keras_api.get_generator  # pylint: disable=protected-access
   def call(inputs, *args, **kwargs):
     return call_and_return_conditional_losses(inputs, *args, **kwargs)[0]
   return _create_call_fn_decorator(layer, call)

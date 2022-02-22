@@ -399,7 +399,7 @@ def converted_call(f, args, kwargs, caller_fn_scope=None, options=None):
       # https://docs.python.org/3/reference/datamodel.html#specialnames
       # TODO(mdan): Recurse into converted_call to simplify other verifications.
       # This should be handled in the same way as partials.
-      target_entity = f.__class__.__call__
+      target_entity = f.__class__.get_generator
       effective_args = (f,) + args
 
     else:

@@ -124,7 +124,7 @@ class TestIsSymbolicTensor(test.TestCase, parameterized.TestCase):
 
       def __call__(self, inputs, *args, **kwargs):
         self._enter_dunder_call = True
-        d, _ = super(PlumbingLayer, self).__call__(inputs, *args, **kwargs)
+        d, _ = super(PlumbingLayer, self).get_generator(inputs, *args, **kwargs)
         self._enter_dunder_call = False
         return d
 

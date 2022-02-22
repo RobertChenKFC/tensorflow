@@ -2320,7 +2320,7 @@ class SingleCycleTests(test.TestCase, parameterized.TestCase):
 
       # Ensure the newly loaded concrete function is the same as the previous
       # after a cycle of serialization / deserialization.
-      new_concrete_function = loaded.__call__.get_concrete_function(
+      new_concrete_function = loaded.get_generator.get_concrete_function(
           tensor_spec.TensorSpec([None, 3], dtypes.float32))
       if previous_concrete_function is not None:
         self.assertEqual(previous_concrete_function.pretty_printed_signature(),

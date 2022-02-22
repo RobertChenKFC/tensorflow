@@ -207,19 +207,19 @@ py_library(
     ],
 )
 
-# Representative datasets for each model
+# Receiver representative dataset for receiving calibration data
 py_library(
-    name = "representative_dataset",
-    srcs = ["representative_dataset.py"],
+    name = "receiver_representative_dataset",
+    srcs = ["receiver_representative_dataset.py"],
 )
 
-# My pass
+# My EdgeTPU pass
 py_binary(
     name = "tflite_convert_with_mypass",
     srcs = ["tflite_convert_with_mypass.py"],
     deps = [
         ":lite",
-        ":representative_dataset",
+        ":receiver_representative_dataset",
     ],
 )
 

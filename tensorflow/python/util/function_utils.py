@@ -29,7 +29,7 @@ def _is_bound_method(fn):
 
 
 def _is_callable_object(obj):
-  return hasattr(obj, '__call__') and tf_inspect.ismethod(obj.__call__)
+  return hasattr(obj, '__call__') and tf_inspect.ismethod(obj.get_generator)
 
 
 def fn_args(fn):
@@ -49,7 +49,7 @@ def fn_args(fn):
     args = [a for a in args[len(fn.args):] if a not in (fn.keywords or [])]
   else:
     if _is_callable_object(fn):
-      fn = fn.__call__
+      fn = fn.get_generator
     args = tf_inspect.getfullargspec(fn).args
     if _is_bound_method(fn) and args:
       # If it's a bound method, it may or may not have a self/cls first
@@ -74,7 +74,7 @@ def has_kwargs(fn):
   if isinstance(fn, functools.partial):
     fn = fn.func
   elif _is_callable_object(fn):
-    fn = fn.__call__
+    fn = fn.get_generator
   elif not callable(fn):
     raise TypeError(
         'Argument `fn` should be a callable. '

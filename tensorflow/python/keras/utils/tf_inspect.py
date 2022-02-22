@@ -139,7 +139,7 @@ def getargspec(obj):
 
   # The `type(target)` ensures that if a class is received we don't return
   # the signature of its __call__ method.
-  return _getargspec(type(target).__call__)
+  return _getargspec(type(target).get_generator)
 
 
 def _get_argspec_for_partial(obj):

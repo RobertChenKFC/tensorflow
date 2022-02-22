@@ -90,7 +90,7 @@ class BaseWrapper(object):
       legal_params_fns.append(self.__call__)
     elif (not isinstance(self.build_fn, types.FunctionType) and
           not isinstance(self.build_fn, types.MethodType)):
-      legal_params_fns.append(self.build_fn.__call__)
+      legal_params_fns.append(self.build_fn.get_generator)
     else:
       legal_params_fns.append(self.build_fn)
 
@@ -149,7 +149,7 @@ class BaseWrapper(object):
     elif (not isinstance(self.build_fn, types.FunctionType) and
           not isinstance(self.build_fn, types.MethodType)):
       self.model = self.build_fn(
-          **self.filter_sk_params(self.build_fn.__call__))
+          **self.filter_sk_params(self.build_fn.get_generator))
     else:
       self.model = self.build_fn(**self.filter_sk_params(self.build_fn))
 

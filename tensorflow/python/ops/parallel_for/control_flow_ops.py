@@ -254,7 +254,7 @@ def _loop_fn_has_config(loop_fn):
     loop_class = tf_decorator.unwrap(loop_fn)[1]
     if not hasattr(loop_class, "__call__"):
       raise ValueError("`loop_fn` object did not have a __call__ method")
-    argspec = tf_inspect.getargspec(loop_class.__call__)
+    argspec = tf_inspect.getargspec(loop_class.get_generator)
     return PFOR_CONFIG_ARG in argspec.args
 
 

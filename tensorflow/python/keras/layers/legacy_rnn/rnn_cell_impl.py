@@ -1166,7 +1166,7 @@ class _RNNCellWrapperV1(RNNCell):
       - New state: A tensor or tuple of tensors with new wrapped cell's state.
     """
     return self._call_wrapped_cell(
-        inputs, state, cell_call_fn=self.cell.__call__, scope=scope)
+        inputs, state, cell_call_fn=self.cell.get_generator, scope=scope)
 
   def get_config(self):
     config = {

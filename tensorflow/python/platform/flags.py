@@ -100,13 +100,13 @@ class _FlagValuesWrapper(object):
     return self.__dict__['__wrapped'].__len__()
 
   def __iter__(self):
-    return self.__dict__['__wrapped'].__iter__()
+    return self.__dict__['__wrapped'].iter()
 
   def __str__(self):
     return self.__dict__['__wrapped'].__str__()
 
   def __call__(self, *args, **kwargs):
-    return self.__dict__['__wrapped'].__call__(*args, **kwargs)
+    return self.__dict__['__wrapped'].get_generator(*args, **kwargs)
 
 
 # pylint: disable=invalid-name,used-before-assignment

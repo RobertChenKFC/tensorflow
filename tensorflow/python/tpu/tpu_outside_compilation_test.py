@@ -100,7 +100,7 @@ def _rewrite_func_wrapper(tf_func):
     # keyword arguments to meet this requirement.
     concrete = tf_func.get_concrete_function(*(list(args) +
                                                list(kwargs.values())))
-    return tpu.rewrite(concrete.__call__, list(args) + list(kwargs.values()))
+    return tpu.rewrite(concrete.get_generator, list(args) + list(kwargs.values()))
 
   return def_function.function(tpu_fn)
 
