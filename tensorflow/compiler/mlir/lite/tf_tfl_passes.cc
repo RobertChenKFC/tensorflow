@@ -1264,7 +1264,7 @@ mlir::LogicalResult ReplaceExpSum::match(mlir::Operation *op) const {
   auto negOneOp = powOp->getOperand(1).getDefiningOp();
   if (!negOneOp)
     return mlir::failure();
-  if (!mlir::isa<mlir::ConstantOp>(negOneOp))
+  if (!mlir::isa<mlir::arith::ConstantOp>(negOneOp))
     return mlir::failure();
   auto negOneAttr = negOneOp->getAttrOfType<mlir::ElementsAttr>("value");
   auto negOne = *negOneAttr.getValues<float>().begin();
