@@ -43,7 +43,7 @@ TRAIN_STEPS = 1000
 
 def main(_):
   # Loads MNIST dataset.
-  train, test = tf.keras.nhwc_datasets.mnist.load_data()
+  train, test = tf.keras.datasets.mnist.load_data()
   train_ds = tf.data.Dataset.from_tensor_slices(train).batch(
       TRAIN_BATCH_SIZE).repeat()
 

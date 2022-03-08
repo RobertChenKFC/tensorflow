@@ -138,7 +138,7 @@ def main(_):
     mnist_train = imgs, labels
     mnist_test = imgs, labels
   else:
-    mnist_train, mnist_test = tf.keras.nhwc_datasets.mnist.load_data()
+    mnist_train, mnist_test = tf.keras.datasets.mnist.load_data()
 
   @tf.function
   def format_example(imgs, labels):

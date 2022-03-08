@@ -852,85 +852,34 @@ mlir::LogicalResult ReplaceResizeNearestNeighbor::matchAndRewrite(
     mlir::TFL::ResizeNearestNeighborOp op, mlir::PatternRewriter &rewriter) const {
   llvm::dbgs() << "INFO: ResizeNearestNeighbor is called!\n";
 
-  auto x = op.getOperand(0);
-  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
-  auto xShapeVec = xType.getShape().vec();
-  auto resultType = op.getResult().getType().dyn_cast<mlir::ShapedType>();
-  auto resultShapeVec = resultType.getShape().vec();
-  auto evenDim = false;
-  if (xShapeVec.size() >= 3)
-    evenDim = (xShapeVec[1] % 2 == 0) && (xShapeVec[2] % 2 == 0);
-  auto xNumElements = static_cast<int64_t>(1);
-  for (auto dim : xShapeVec)
-    xNumElements *= dim;
+//  // Choosing the value 589824 because this pass was originally written for a
+//  // GLADNet model, and only one of the ResizeNearestNeighbor operations
+//  // couldn't be mapped to the TPU, and the input of that operation had size
+//  // (1, 96, 96, 64)
+//  return ResizePass<mlir::TFL::ResizeNearestNeighborOp>(
+//      rewriter, op, 589824, {1, 2, 2, 1});
 
-  // DEBUG
-  llvm::dbgs() << "Even dim: " << evenDim << "\n";
-  llvm::dbgs() << "xNumElements: " << xNumElements << "\n";
-
-  // Choosing the value 1228800 because this pass was originally written for a
-  // text detection model, and only one of the ResizeNearestNeighbor operations
-  // couldn't be mapped to the TPU, and the input of that operation had size
-  // (1, 60, 80, 256)
-  if (evenDim && xShapeVec.size() == 4 && xNumElements >= 1228800) {
-    auto subXShapeVec = xShapeVec;
-    subXShapeVec[1] /= 2;
-    subXShapeVec[2] /= 2;
-
-    auto xSizeVec = std::vector<int32_t>{
-        static_cast<int32_t>(xShapeVec[1]),
-        static_cast<int32_t>(xShapeVec[2])
-    };
-    auto xSizeAttr = rewriter.getI32TensorAttr(xSizeVec);
-    auto xSize = rewriter.create<mlir::TFL::ConstOp>(
-        op.getLoc(), xSizeAttr.getType(), xSizeAttr);
-
-    auto resizedXs = std::vector<mlir::Value>();
-    auto halfH = subXShapeVec[1];
-    auto halfW = subXShapeVec[2];
-    for (auto h = static_cast<int64_t>(0); h < xShapeVec[1]; h += halfH) {
-      for (auto w = static_cast<int64_t>(0); w < xShapeVec[1]; w += halfW) {
-        auto subX = StridedSlice(
-            rewriter, op.getLoc(), x, xType, subXShapeVec,
-            {
-                0,
-                static_cast<int32_t>(h),
-                static_cast<int32_t>(w),
-                0
-            },
-            {
-                static_cast<int32_t>(xShapeVec[0]),
-                static_cast<int32_t>(h + halfH),
-                static_cast<int32_t>(w + halfW),
-                static_cast<int32_t>(xShapeVec[3])
-            },
-            {1, 1, 1, 1});
-
-        // DEBUG
-        subX.dump();
-
-        auto resizedX = rewriter.create<mlir::TFL::ResizeNearestNeighborOp>(
-            op.getLoc(), xType, subX, xSize, false);
-
-        // DEBUG
-        resizedX.dump();
-
-        resizedXs.push_back(resizedX);
-      }
+    // Originally, I thought that this operation couldn't be mapped because
+    // its tensor size was too big (similar to ResizeBilinear), but it turns
+    // out that this operation is unsupported if the tensor is scaled up.
+    auto x = op.getOperand(0);
+    auto xShape = x.getType().dyn_cast<mlir::ShapedType>().getShape();
+    auto resultType = op.getResult().getType().dyn_cast<mlir::ShapedType>();
+    auto resultShape = resultType.getShape();
+    auto xSize = 1;
+    for (auto dim : xShape) xSize *= dim;
+    auto resultSize = 1;
+    for (auto dim : resultShape) resultSize *= dim;
+    if (resultSize > xSize) {
+      // There is no obvious way to directly implement this operation using
+      // others, so we just replace it with ResizeBilinear.
+      rewriter.replaceOpWithNewOp<mlir::TFL::ResizeBilinearOp>(
+          op, resultType, x, op.getOperand(1),
+          op->getAttrOfType<mlir::BoolAttr>("align_corners"),
+          op->getAttrOfType<mlir::BoolAttr>("half_pixel_centers"));
+      return mlir::success();
     }
-
-    auto top = Concat(
-        rewriter, op.getLoc(), {resizedXs[0], resizedXs[1]}, 2);
-    auto bottom = Concat(
-        rewriter, op.getLoc(), {resizedXs[2], resizedXs[3]}, 2);
-    auto result = Concat(
-        rewriter, op.getLoc(), {top, bottom}, 1);
-    rewriter.replaceOp(op, {result});
-
-    return mlir::success();
-  }
-
-  return mlir::failure();
+    return mlir::failure();
 }
 
 ReplaceResizeBilinear::ReplaceResizeBilinear(mlir::MLIRContext *ctx)
@@ -940,176 +889,12 @@ mlir::LogicalResult ReplaceResizeBilinear::matchAndRewrite(
     mlir::TFL::ResizeBilinearOp op, mlir::PatternRewriter &rewriter) const {
   llvm::dbgs() << "INFO: ResizeBilinear is called!\n";
 
-  // TODO: combine with ResizeNearestNeighbor using templates
-
-  auto x = op.getOperand(0);
-  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
-  auto xShapeVec = xType.getShape().vec();
-  auto resultType = op.getResult().getType().dyn_cast<mlir::ShapedType>();
-  auto resultShapeVec = resultType.getShape().vec();
-  auto evenDim = false;
-  if (xShapeVec.size() >= 3)
-    evenDim = (xShapeVec[1] % 2 == 0) && (xShapeVec[2] % 2 == 0);
-  auto xNumElements = static_cast<int64_t>(1);
-  // DEBUG
-  llvm::dbgs() << "Shape:";
-  for (auto dim : xShapeVec) {
-    xNumElements *= dim;
-
-    llvm::dbgs() << " " << dim;
-  }
-  llvm::dbgs() << "\n";
-
-  // DEBUG
-  llvm::dbgs() << "Even dim: " << evenDim << "\n";
-  llvm::dbgs() << "xNumElements: " << xNumElements << "\n";
-
   // Choosing the value 1048576 because this pass was originally written for
   // U2-net, and only one of the ResizeBilinear operations
   // couldn't be mapped to the TPU, and the input of that operation had size
   // (1, 128, 128, 64)
-  if (evenDim && xShapeVec.size() == 4 && xNumElements >= 1048576) {
-    // Old method: split image
-    /*
-    // The larger U2-net (320x320) has to be split into 8 parts to be mapped to
-    // the TPU, while the smaller U2-net (256x256) only has to be split into
-    // 4 parts
-    auto numSplits = std::vector<int32_t>{1, 2, 2, 1};
-    if (xNumElements >= 1638400 && xShapeVec[1] % 4 == 0)
-      numSplits = {1, 4, 2, 1};
-    */
-    // New method: split channel
-    auto numSplits = std::vector<int32_t>{1, 1, 1, 4};
-
-    auto begins = std::vector<std::vector<int32_t>>{{}};
-    auto ends = std::vector<std::vector<int32_t>>{{}};
-    auto resizedXShapes = std::vector<std::vector<int64_t>>{{}};
-    auto numDims = 4;
-    auto stride = std::vector<int32_t>(numDims, 1);
-    for (auto i = 0; i < numDims; ++i) {
-      auto numSplit = numSplits[i];
-      auto dimSize = xShapeVec[i];
-      auto size = dimSize / numSplit;
-      auto resizedDimSize = resultShapeVec[i];
-      auto resizedSize = resizedDimSize / numSplit;
-      auto curBegins = decltype(begins)();
-      auto curEnds = decltype(ends)();
-      auto curResizedXShapes = decltype(resizedXShapes)();
-      for (auto j = 0; j < begins.size(); ++j) {
-        for (auto k = 0; k < numSplit; ++k) {
-          auto begin = begins[j];
-          auto end = ends[j];
-          auto resizedXShape = resizedXShapes[j];
-          begin.push_back(k * size);
-          curBegins.push_back(begin);
-          if (k == numSplit - 1) {
-            end.push_back(dimSize);
-            resizedXShape.push_back(resizedSize + resizedDimSize % numSplit);
-          } else {
-            end.push_back((k + 1) * size);
-            resizedXShape.push_back(resizedSize);
-          }
-          curEnds.push_back(end);
-          curResizedXShapes.push_back(resizedXShape);
-
-          // DEBUG
-          llvm::dbgs() << "axis: " << i << ", numSplit: " << numSplit << ", "
-                       << "begin: ( ";
-          for (auto a : begin)
-            llvm::dbgs() << a << " ";
-          llvm::dbgs() << "), end: ( ";
-          for (auto a : end)
-            llvm::dbgs() << a << " ";
-          llvm::dbgs() << "), resized shape: (";
-          for (auto a : resizedXShape)
-            llvm::dbgs() << a << " ";
-          llvm::dbgs() << ")\n";
-        }
-      }
-      begins = std::move(curBegins);
-      ends = std::move(curEnds);
-      resizedXShapes = std::move(curResizedXShapes);
-    }
-    // DEBUG
-    for (auto i = 0; i < begins.size(); ++i) {
-      llvm::dbgs() << "i: " << i << ", begin ( ";
-      for (auto j : begins[i])
-        llvm::dbgs() << j << " ";
-      llvm::dbgs() << "), end ( ";
-      for (auto j : ends[i])
-        llvm::dbgs() << j << " ";
-      llvm::dbgs() << "), resized shape: (";
-      for (auto a : resizedXShapes[i])
-        llvm::dbgs() << a << " ";
-      llvm::dbgs() << ")\n";
-    }
-
-    auto resizedXs = std::vector<mlir::Value>();
-    for (auto i = 0; i < begins.size(); ++i) {
-      auto subXShapeVec = std::vector<int64_t>();
-      for (auto j = 0; j < numDims; ++j)
-        subXShapeVec.push_back(ends[i][j] - begins[i][j]);
-      auto subX = StridedSlice(
-          rewriter, op.getLoc(), x, xType, subXShapeVec,
-          begins[i], ends[i], stride);
-
-      // DEBUG
-      llvm::dbgs() << "subX: ";
-      subX.dump();
-
-      auto resizedXShapeVec = resizedXShapes[i];
-      auto resizedXType = resultType.clone(resizedXShapeVec);
-      auto xSizeVec = std::vector<int32_t>{
-        static_cast<int32_t>(resizedXShapeVec[1]),
-        static_cast<int32_t>(resizedXShapeVec[2])
-      };
-      auto xSizeAttr = rewriter.getI32TensorAttr(xSizeVec);
-      auto xSize = rewriter.create<mlir::TFL::ConstOp>(
-          op.getLoc(), xSizeAttr.getType(), xSizeAttr);
-
-      // DEBUG
-      llvm::dbgs() << "xSize: ";
-      xSize.dump();
-
-      auto resizedX = rewriter.create<mlir::TFL::ResizeBilinearOp>(
-          op.getLoc(), resizedXType, subX, xSize, false);
-
-      // DEBUG
-      llvm::dbgs() << "resizedX: ";
-      resizedX.dump();
-
-      resizedXs.push_back(resizedX);
-    }
-
-    for (auto i = numDims - 1; i >= 0; --i) {
-      auto numSplit = numSplits[i];
-      if (numSplit == 1)
-        continue;
-      auto dimSize = xShapeVec[i];
-      auto curResizedXs = decltype(resizedXs)();
-      for (auto j = 0; j < resizedXs.size(); j += numSplit) {
-        auto concatXs = std::vector<mlir::Value>(
-            resizedXs.begin() + j, resizedXs.begin() + j + numSplit);
-        auto curResizedX = Concat(rewriter, op.getLoc(), concatXs, i);
-
-        // DEBUG
-        llvm::dbgs() << "curResizedX: ";
-        curResizedX.dump();
-
-        curResizedXs.push_back(curResizedX);
-      }
-      resizedXs = std::move(curResizedXs);
-    }
-
-    // DEBUG
-    llvm::dbgs() << "number of resized xs left: " << resizedXs.size() << "\n";
-
-    rewriter.replaceOp(op, resizedXs);
-
-    return mlir::success();
-  }
-
-  return mlir::failure();
+  return ResizePass<mlir::TFL::ResizeBilinearOp>(
+      rewriter, op, 1048576, {1, 1, 1, 4});
 }
 
 ReplaceHardSwishOp::ReplaceHardSwishOp(mlir::MLIRContext *ctx)
