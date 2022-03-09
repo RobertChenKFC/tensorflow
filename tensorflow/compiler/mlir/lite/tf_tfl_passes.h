@@ -230,8 +230,26 @@ struct ReplaceSumOp : public mlir::OpRewritePattern<
       mlir::PatternRewriter &rewriter) const override;
 };
 
-struct ReplaceAveragePool2DOp : public mlir::OpRewritePattern<
-    mlir::TFL::AveragePool2DOp> {
+struct ReplaceExpSum : public mlir::RewritePattern {
+  ReplaceExpSum(mlir::MLIRContext *ctx, mlir::PatternBenefit benefit = 1);
+
+  mlir::LogicalResult match(mlir::Operation *op) const override;
+
+  void rewrite(
+      mlir::Operation *op, mlir::PatternRewriter &rewriter) const override;
+};
+
+struct ReplaceMaxPool2DOp : public
+                            mlir::OpRewritePattern<mlir::TFL::MaxPool2DOp> {
+  explicit ReplaceMaxPool2DOp(mlir::MLIRContext *ctx);
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::TFL::MaxPool2DOp op,
+      mlir::PatternRewriter &rewriter) const override;
+};
+
+struct ReplaceAveragePool2DOp :
+    public mlir::OpRewritePattern<mlir::TFL::AveragePool2DOp> {
   explicit ReplaceAveragePool2DOp(mlir::MLIRContext *ctx);
 
   mlir::LogicalResult matchAndRewrite(
@@ -245,6 +263,15 @@ struct ReplaceReshapeOp : public mlir::OpRewritePattern<mlir::TFL::ReshapeOp> {
   mlir::LogicalResult matchAndRewrite(
       mlir::TFL::ReshapeOp op,
       mlir::PatternRewriter &rewriter) const override;
+};
+
+struct ReplaceMulPow : public mlir::RewritePattern {
+  ReplaceMulPow(mlir::MLIRContext *ctx, mlir::PatternBenefit = 1);
+
+  mlir::LogicalResult match(mlir::Operation *op) const override;
+
+  void rewrite(
+      mlir::Operation *op, mlir::PatternRewriter &rewriter) const override;
 };
 
 struct AllTFLPasses : public mlir::PassWrapper<AllTFLPasses,
@@ -266,23 +293,6 @@ struct ReplaceTFUnpackOp : public mlir::OpRewritePattern<mlir::TF::UnpackOp> {
 
   mlir::LogicalResult matchAndRewrite(
       mlir::TF::UnpackOp op, mlir::PatternRewriter &rewriter) const override;
-};
-
-struct ReplaceExpSum : public mlir::RewritePattern {
-  ReplaceExpSum(mlir::MLIRContext *ctx, mlir::PatternBenefit benefit = 1);
-
-  mlir::LogicalResult match(mlir::Operation *op) const override;
-
-  void rewrite(
-      mlir::Operation *op, mlir::PatternRewriter &rewriter) const override;
-};
-
-struct ReplaceMaxPool2DOp : public
-                            mlir::OpRewritePattern<mlir::TFL::MaxPool2DOp> {
-  explicit ReplaceMaxPool2DOp(mlir::MLIRContext *ctx);
-
-  mlir::LogicalResult matchAndRewrite(
-      mlir::TFL::MaxPool2DOp op, mlir::PatternRewriter &rewriter) const override;
 };
 
 struct AllTFPasses : public mlir::PassWrapper<AllTFPasses,
@@ -332,7 +342,8 @@ mlir::Value ScalarConst(
 
 template <class ResizeOp>
 mlir::LogicalResult ResizePass(mlir::PatternRewriter &rewriter, ResizeOp op,
-                               int64_t numElementsThresh,
+                               const std::vector<int64_t> &inputDimThreshs,
+                               const std::vector<int64_t> &outputDimThreshs,
                                const std::vector<int32_t> &numSplits) {
   auto x = op.getOperand(0);
   auto xType = x.getType().template dyn_cast<mlir::ShapedType>();
@@ -340,149 +351,143 @@ mlir::LogicalResult ResizePass(mlir::PatternRewriter &rewriter, ResizeOp op,
   auto resultType = op.getResult().getType().template dyn_cast<
       mlir::ShapedType>();
   auto resultShapeVec = resultType.getShape().vec();
-  auto evenDim = false;
-  if (xShapeVec.size() >= 3)
-    evenDim = (xShapeVec[1] % 2 == 0) && (xShapeVec[2] % 2 == 0);
-  auto xNumElements = static_cast<int64_t>(1);
-  for (auto dim : xShapeVec)
-    xNumElements *= dim;
 
-  // DEBUG
-  llvm::dbgs() << "Even dim: " << evenDim << "\n";
-  llvm::dbgs() << "xNumElements: " << xNumElements << "\n";
-
-  if (evenDim && xShapeVec.size() == 4 && xNumElements >= numElementsThresh) {
-    auto begins = std::vector<std::vector<int32_t>>{{}};
-    auto ends = std::vector<std::vector<int32_t>>{{}};
-    auto resizedXShapes = std::vector<std::vector<int64_t>>{{}};
-    auto numDims = 4;
-    auto stride = std::vector<int32_t>(numDims, 1);
-    for (auto i = 0; i < numDims; ++i) {
-      auto numSplit = numSplits[i];
-      auto dimSize = xShapeVec[i];
-      auto size = dimSize / numSplit;
-      auto resizedDimSize = resultShapeVec[i];
-      auto resizedSize = resizedDimSize / numSplit;
-      auto curBegins = decltype(begins)();
-      auto curEnds = decltype(ends)();
-      auto curResizedXShapes = decltype(resizedXShapes)();
-      for (auto j = 0; j < begins.size(); ++j) {
-        for (auto k = 0; k < numSplit; ++k) {
-          auto begin = begins[j];
-          auto end = ends[j];
-          auto resizedXShape = resizedXShapes[j];
-          begin.push_back(k * size);
-          curBegins.push_back(begin);
-          if (k == numSplit - 1) {
-            end.push_back(dimSize);
-            resizedXShape.push_back(resizedSize + resizedDimSize % numSplit);
-          } else {
-            end.push_back((k + 1) * size);
-            resizedXShape.push_back(resizedSize);
-          }
-          curEnds.push_back(end);
-          curResizedXShapes.push_back(resizedXShape);
-
-          // DEBUG
-          llvm::dbgs() << "axis: " << i << ", numSplit: " << numSplit << ", "
-                       << "begin: ( ";
-          for (auto a : begin)
-            llvm::dbgs() << a << " ";
-          llvm::dbgs() << "), end: ( ";
-          for (auto a : end)
-            llvm::dbgs() << a << " ";
-          llvm::dbgs() << "), resized shape: (";
-          for (auto a : resizedXShape)
-            llvm::dbgs() << a << " ";
-          llvm::dbgs() << ")\n";
-        }
-      }
-      begins = std::move(curBegins);
-      ends = std::move(curEnds);
-      resizedXShapes = std::move(curResizedXShapes);
-    }
-    // DEBUG
-    for (auto i = 0; i < begins.size(); ++i) {
-      llvm::dbgs() << "i: " << i << ", begin ( ";
-      for (auto j : begins[i])
-        llvm::dbgs() << j << " ";
-      llvm::dbgs() << "), end ( ";
-      for (auto j : ends[i])
-        llvm::dbgs() << j << " ";
-      llvm::dbgs() << "), resized shape: (";
-      for (auto a : resizedXShapes[i])
-        llvm::dbgs() << a << " ";
-      llvm::dbgs() << ")\n";
-    }
-
-    auto resizedXs = std::vector<mlir::Value>();
-    for (auto i = 0; i < begins.size(); ++i) {
-      auto subXShapeVec = std::vector<int64_t>();
-      for (auto j = 0; j < numDims; ++j)
-        subXShapeVec.push_back(ends[i][j] - begins[i][j]);
-      auto subX = StridedSlice(
-          rewriter, op.getLoc(), x, xType, subXShapeVec,
-          begins[i], ends[i], stride);
-
-      // DEBUG
-      llvm::dbgs() << "subX: ";
-      subX.dump();
-
-      auto resizedXShapeVec = resizedXShapes[i];
-      auto resizedXType = resultType.clone(resizedXShapeVec);
-      auto xSizeVec = std::vector<int32_t>{
-          static_cast<int32_t>(resizedXShapeVec[1]),
-          static_cast<int32_t>(resizedXShapeVec[2])
-      };
-      auto xSizeAttr = rewriter.getI32TensorAttr(xSizeVec);
-      auto xSize = rewriter.create<mlir::TFL::ConstOp>(
-          op.getLoc(), xSizeAttr.getType(), xSizeAttr);
-
-      // DEBUG
-      llvm::dbgs() << "xSize: ";
-      xSize.dump();
-
-      auto resizedX = rewriter.create<ResizeOp>(
-          op.getLoc(), resizedXType, subX, xSize,
-          op->template getAttrOfType<mlir::BoolAttr>("align_corners"),
-          op->template getAttrOfType<mlir::BoolAttr>("half_pixel_centers"));
-
-      // DEBUG
-      llvm::dbgs() << "resizedX: ";
-      resizedX.dump();
-
-      resizedXs.push_back(resizedX);
-    }
-
-    for (auto i = numDims - 1; i >= 0; --i) {
-      auto numSplit = numSplits[i];
-      if (numSplit == 1)
-        continue;
-      auto dimSize = xShapeVec[i];
-      auto curResizedXs = decltype(resizedXs)();
-      for (auto j = 0; j < resizedXs.size(); j += numSplit) {
-        auto concatXs = std::vector<mlir::Value>(
-            resizedXs.begin() + j, resizedXs.begin() + j + numSplit);
-        auto curResizedX = Concat(rewriter, op.getLoc(), concatXs, i);
-
-        // DEBUG
-        llvm::dbgs() << "curResizedX: ";
-        curResizedX.dump();
-
-        curResizedXs.push_back(curResizedX);
-      }
-      resizedXs = std::move(curResizedXs);
-    }
-
-    // DEBUG
-    llvm::dbgs() << "number of resized xs left: " << resizedXs.size() << "\n";
-
-    rewriter.replaceOp(op, resizedXs);
-
-    return mlir::success();
+  if (xShapeVec.size() != 4 || resultShapeVec.size() != 4)
+    return mlir::failure();
+  for (auto i = 0; i < 4; ++i) {
+    if (xShapeVec[i] < inputDimThreshs[i] ||
+        resultShapeVec[i] < outputDimThreshs[i])
+      return mlir::failure();
   }
 
-  return mlir::failure();
+  auto begins = std::vector<std::vector<int32_t>>{{}};
+  auto ends = std::vector<std::vector<int32_t>>{{}};
+  auto resizedXShapes = std::vector<std::vector<int64_t>>{{}};
+  auto numDims = 4;
+  auto stride = std::vector<int32_t>(numDims, 1);
+  for (auto i = 0; i < numDims; ++i) {
+    auto numSplit = numSplits[i];
+    auto dimSize = xShapeVec[i];
+    auto size = dimSize / numSplit;
+    auto resizedDimSize = resultShapeVec[i];
+    auto resizedSize = resizedDimSize / numSplit;
+    auto curBegins = decltype(begins)();
+    auto curEnds = decltype(ends)();
+    auto curResizedXShapes = decltype(resizedXShapes)();
+    for (auto j = 0; j < begins.size(); ++j) {
+      for (auto k = 0; k < numSplit; ++k) {
+        auto begin = begins[j];
+        auto end = ends[j];
+        auto resizedXShape = resizedXShapes[j];
+        begin.push_back(k * size);
+        curBegins.push_back(begin);
+        if (k == numSplit - 1) {
+          end.push_back(dimSize);
+          resizedXShape.push_back(resizedSize + resizedDimSize % numSplit);
+        } else {
+          end.push_back((k + 1) * size);
+          resizedXShape.push_back(resizedSize);
+        }
+        curEnds.push_back(end);
+        curResizedXShapes.push_back(resizedXShape);
+
+        // DEBUG
+        llvm::dbgs() << "axis: " << i << ", numSplit: " << numSplit << ", "
+                     << "begin: ( ";
+        for (auto a : begin)
+          llvm::dbgs() << a << " ";
+        llvm::dbgs() << "), end: ( ";
+        for (auto a : end)
+          llvm::dbgs() << a << " ";
+        llvm::dbgs() << "), resized shape: (";
+        for (auto a : resizedXShape)
+          llvm::dbgs() << a << " ";
+        llvm::dbgs() << ")\n";
+      }
+    }
+    begins = std::move(curBegins);
+    ends = std::move(curEnds);
+    resizedXShapes = std::move(curResizedXShapes);
+  }
+  // DEBUG
+  for (auto i = 0; i < begins.size(); ++i) {
+    llvm::dbgs() << "i: " << i << ", begin ( ";
+    for (auto j : begins[i])
+      llvm::dbgs() << j << " ";
+    llvm::dbgs() << "), end ( ";
+    for (auto j : ends[i])
+      llvm::dbgs() << j << " ";
+    llvm::dbgs() << "), resized shape: (";
+    for (auto a : resizedXShapes[i])
+      llvm::dbgs() << a << " ";
+    llvm::dbgs() << ")\n";
+  }
+
+  auto resizedXs = std::vector<mlir::Value>();
+  for (auto i = 0; i < begins.size(); ++i) {
+    auto subXShapeVec = std::vector<int64_t>();
+    for (auto j = 0; j < numDims; ++j)
+      subXShapeVec.push_back(ends[i][j] - begins[i][j]);
+    auto subX = StridedSlice(
+        rewriter, op.getLoc(), x, xType, subXShapeVec,
+        begins[i], ends[i], stride);
+
+    // DEBUG
+    llvm::dbgs() << "subX: ";
+    subX.dump();
+
+    auto resizedXShapeVec = resizedXShapes[i];
+    auto resizedXType = resultType.clone(resizedXShapeVec);
+    auto xSizeVec = std::vector<int32_t>{
+        static_cast<int32_t>(resizedXShapeVec[1]),
+        static_cast<int32_t>(resizedXShapeVec[2])
+    };
+    auto xSizeAttr = rewriter.getI32TensorAttr(xSizeVec);
+    auto xSize = rewriter.create<mlir::TFL::ConstOp>(
+        op.getLoc(), xSizeAttr.getType(), xSizeAttr);
+
+    // DEBUG
+    llvm::dbgs() << "xSize: ";
+    xSize.dump();
+
+    auto resizedX = rewriter.create<ResizeOp>(
+        op.getLoc(), resizedXType, subX, xSize,
+        op->template getAttrOfType<mlir::BoolAttr>("align_corners"),
+        op->template getAttrOfType<mlir::BoolAttr>("half_pixel_centers"));
+
+    // DEBUG
+    llvm::dbgs() << "resizedX: ";
+    resizedX.dump();
+
+    resizedXs.push_back(resizedX);
+  }
+
+  for (auto i = numDims - 1; i >= 0; --i) {
+    auto numSplit = numSplits[i];
+    if (numSplit == 1)
+      continue;
+    auto dimSize = xShapeVec[i];
+    auto curResizedXs = decltype(resizedXs)();
+    for (auto j = 0; j < resizedXs.size(); j += numSplit) {
+      auto concatXs = std::vector<mlir::Value>(
+          resizedXs.begin() + j, resizedXs.begin() + j + numSplit);
+      auto curResizedX = Concat(rewriter, op.getLoc(), concatXs, i);
+
+      // DEBUG
+      llvm::dbgs() << "curResizedX: ";
+      curResizedX.dump();
+
+      curResizedXs.push_back(curResizedX);
+    }
+    resizedXs = std::move(curResizedXs);
+  }
+
+  // DEBUG
+  llvm::dbgs() << "number of resized xs left: " << resizedXs.size() << "\n";
+
+  rewriter.replaceOp(op, resizedXs);
+
+  return mlir::success();
 }
 
 void AddMyTFPass(

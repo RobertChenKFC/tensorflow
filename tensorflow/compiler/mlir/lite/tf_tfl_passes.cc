@@ -852,34 +852,27 @@ mlir::LogicalResult ReplaceResizeNearestNeighbor::matchAndRewrite(
     mlir::TFL::ResizeNearestNeighborOp op, mlir::PatternRewriter &rewriter) const {
   llvm::dbgs() << "INFO: ResizeNearestNeighbor is called!\n";
 
-//  // Choosing the value 589824 because this pass was originally written for a
-//  // GLADNet model, and only one of the ResizeNearestNeighbor operations
-//  // couldn't be mapped to the TPU, and the input of that operation had size
-//  // (1, 96, 96, 64)
-//  return ResizePass<mlir::TFL::ResizeNearestNeighborOp>(
-//      rewriter, op, 589824, {1, 2, 2, 1});
-
-    // Originally, I thought that this operation couldn't be mapped because
-    // its tensor size was too big (similar to ResizeBilinear), but it turns
-    // out that this operation is unsupported if the tensor is scaled up.
-    auto x = op.getOperand(0);
-    auto xShape = x.getType().dyn_cast<mlir::ShapedType>().getShape();
-    auto resultType = op.getResult().getType().dyn_cast<mlir::ShapedType>();
-    auto resultShape = resultType.getShape();
-    auto xSize = 1;
-    for (auto dim : xShape) xSize *= dim;
-    auto resultSize = 1;
-    for (auto dim : resultShape) resultSize *= dim;
-    if (resultSize > xSize) {
-      // There is no obvious way to directly implement this operation using
-      // others, so we just replace it with ResizeBilinear.
-      rewriter.replaceOpWithNewOp<mlir::TFL::ResizeBilinearOp>(
-          op, resultType, x, op.getOperand(1),
-          op->getAttrOfType<mlir::BoolAttr>("align_corners"),
-          op->getAttrOfType<mlir::BoolAttr>("half_pixel_centers"));
-      return mlir::success();
-    }
-    return mlir::failure();
+  // Originally, I thought that this operation couldn't be mapped because
+  // its tensor size was too big (similar to ResizeBilinear), but it turns
+  // out that this operation is unsupported if the tensor is scaled up.
+  auto x = op.getOperand(0);
+  auto xShape = x.getType().dyn_cast<mlir::ShapedType>().getShape();
+  auto resultType = op.getResult().getType().dyn_cast<mlir::ShapedType>();
+  auto resultShape = resultType.getShape();
+  auto xSize = 1;
+  for (auto dim : xShape) xSize *= dim;
+  auto resultSize = 1;
+  for (auto dim : resultShape) resultSize *= dim;
+  if (resultSize > xSize) {
+    // There is no obvious way to directly implement this operation using
+    // others, so we just replace it with ResizeBilinear.
+    rewriter.replaceOpWithNewOp<mlir::TFL::ResizeBilinearOp>(
+        op, resultType, x, op.getOperand(1),
+        op->getAttrOfType<mlir::BoolAttr>("align_corners"),
+        op->getAttrOfType<mlir::BoolAttr>("half_pixel_centers"));
+    return mlir::success();
+  }
+  return mlir::failure();
 }
 
 ReplaceResizeBilinear::ReplaceResizeBilinear(mlir::MLIRContext *ctx)
@@ -889,12 +882,15 @@ mlir::LogicalResult ReplaceResizeBilinear::matchAndRewrite(
     mlir::TFL::ResizeBilinearOp op, mlir::PatternRewriter &rewriter) const {
   llvm::dbgs() << "INFO: ResizeBilinear is called!\n";
 
-  // Choosing the value 1048576 because this pass was originally written for
-  // U2-net, and only one of the ResizeBilinear operations
-  // couldn't be mapped to the TPU, and the input of that operation had size
-  // (1, 128, 128, 64)
+  // U^2 Net
+  auto result = ResizePass<mlir::TFL::ResizeBilinearOp>(
+      rewriter, op, {1, 160, 160, 64}, {1, 320, 320, 64}, {1, 1, 1, 4});
+  if (result.succeeded())
+    return result;
+
+  // GLADNet
   return ResizePass<mlir::TFL::ResizeBilinearOp>(
-      rewriter, op, 1048576, {1, 1, 1, 4});
+      rewriter, op, {1, 96, 96, 64}, {1, 180, 320, 64}, {1, 2, 2, 1});
 }
 
 ReplaceHardSwishOp::ReplaceHardSwishOp(mlir::MLIRContext *ctx)
@@ -1228,6 +1224,77 @@ mlir::LogicalResult ReplaceReshapeOp::matchAndRewrite(
   return mlir::failure();
 }
 
+ReplaceMulPow::ReplaceMulPow(mlir::MLIRContext *ctx,
+                             mlir::PatternBenefit benefit)
+    : mlir::RewritePattern(mlir::TFL::MulOp::getOperationName(), benefit,
+                           ctx) {}
+
+mlir::LogicalResult ReplaceMulPow::match(mlir::Operation *op) const {
+  // DEBUG
+  llvm::dbgs() << "mul pow op: ";
+  op->dump();
+
+  auto activation = op->getAttrOfType<mlir::StringAttr>(
+      "fused_activation_function").getValue();
+
+  // DEBUG
+  llvm::dbgs() << "activation: " << activation << "\n";
+
+  if (activation != "NONE")
+    return mlir::failure();
+  auto x = op->getOperand(0).getDefiningOp();
+  auto y = op->getOperand(1).getDefiningOp();
+  auto xIsPow = x && mlir::isa<mlir::TFL::PowOp>(x);
+  auto yIsPow = y && mlir::isa<mlir::TFL::PowOp>(y);
+
+  // DEBUG
+  llvm::dbgs() << "xIsPow: " << xIsPow << ", yIsPow: " << yIsPow << "\n";
+
+  if (xIsPow || yIsPow) {
+    if (xIsPow && yIsPow)
+      return mlir::failure();
+    if (xIsPow)
+      std::swap(x, y);
+  } else {
+    return mlir::failure();
+  }
+  auto pOp = y->getOperand(1).getDefiningOp();
+
+  // DEBUG
+  llvm::dbgs() << "pOp: ";
+  pOp->dump();
+
+  if (!mlir::isa<mlir::arith::ConstantOp>(pOp))
+    return mlir::failure();
+  auto pAttr = pOp->getAttrOfType<mlir::ElementsAttr>("value");
+  auto pValue = *pAttr.getValues<float>().begin();
+
+  // DEBUG
+  llvm::dbgs() << "pValue: " << pValue << "\n";
+
+  if (pValue != -1)
+    return mlir::failure();
+  return mlir::success();
+}
+
+void ReplaceMulPow::rewrite(mlir::Operation *op,
+                            mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: ReplacePowOp is called!\n";
+
+  auto x = op->getOperand(0);
+  auto y = op->getOperand(1);
+  auto xOp = x.getDefiningOp();
+  if (xOp && mlir::isa<mlir::TFL::PowOp>(xOp))
+    std::swap(x, y);
+  y = y.getDefiningOp()->getOperand(0);
+  auto result = rewriter.replaceOpWithNewOp<mlir::TFL::DivOp>(
+      op, op->getResult(0).getType(), x, y, "NONE");
+
+  // DEBUG
+  llvm::dbgs() << "result: ";
+  result.dump();
+}
+
 #define MY_TFL_PASS
 void AllTFLPasses::runOnOperation() {
   auto ctx = &getContext();
@@ -1262,6 +1329,7 @@ void AllTFLPasses::runOnOperation() {
   patterns.insert(std::make_unique<ReplaceMaxPool2DOp>(ctx));
   patterns.insert(std::make_unique<ReplaceAveragePool2DOp>(ctx));
   patterns.insert(std::make_unique<ReplaceReshapeOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceMulPow>(ctx));
 
   mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
 }
