@@ -882,9 +882,15 @@ mlir::LogicalResult ReplaceResizeBilinear::matchAndRewrite(
     mlir::TFL::ResizeBilinearOp op, mlir::PatternRewriter &rewriter) const {
   llvm::dbgs() << "INFO: ResizeBilinear is called!\n";
 
-  // U^2 Net
+  // U^2 Net 320x320
   auto result = ResizePass<mlir::TFL::ResizeBilinearOp>(
-      rewriter, op, {1, 160, 160, 64}, {1, 320, 320, 64}, {1, 1, 1, 4});
+      rewriter, op, {1, 160, 160, 64}, {1, 320, 320, 64}, {1, 2, 2, 1});
+  if (result.succeeded())
+    return result;
+
+  // U^2 Net 256x256
+  result = ResizePass<mlir::TFL::ResizeBilinearOp>(
+      rewriter, op, {1, 128, 128, 64}, {1, 256, 256, 64}, {1, 1, 1, 4});
   if (result.succeeded())
     return result;
 
