@@ -1,6 +1,6 @@
 import argparse
-import lite
-import tensorflow.python.framework
+import os
+
 from receiver_representative_dataset import ReceiverRepresentativeDataset
 
 
@@ -47,9 +47,17 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # This operation requires Flex Ops, and Flex Ops can only use CPU kernels,
+    # so we disable the GPU so that the CPU kernel can be chosen.
+    if args.enable_flex:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+    import lite
+    import tensorflow.python.framework
+
     converter = lite.TFLiteConverterV2.from_saved_model(args.model_dir)
-    converter.optimizations = [lite.Optimize.DEFAULT]
     if args.representative_dataset_address:
+        converter.optimizations = [lite.Optimize.DEFAULT]
         converter.representative_dataset = ReceiverRepresentativeDataset(
             args.representative_dataset_address
         )
@@ -70,6 +78,16 @@ if __name__ == "__main__":
             dtype = tensorflow.python.framework.dtypes.int8
         converter.inference_input_type = dtype
         converter.inference_output_type = dtype
+    else:
+        if args.enable_flex:
+            converter.target_spec.supported_ops = [
+                lite.OpsSet.TFLITE_BUILTINS,
+                lite.OpsSet.SELECT_TF_OPS,
+            ]
+        else:
+            converter.target_spec.supported_ops = [
+                lite.OpsSet.TFLITE_BUILTINS
+            ]
 
     tflite_model = converter.convert()
     with open(args.tflite_model_path, "wb") as outfile:

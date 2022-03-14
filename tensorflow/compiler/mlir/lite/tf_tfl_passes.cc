@@ -1236,26 +1236,14 @@ ReplaceMulPow::ReplaceMulPow(mlir::MLIRContext *ctx,
                            ctx) {}
 
 mlir::LogicalResult ReplaceMulPow::match(mlir::Operation *op) const {
-  // DEBUG
-  llvm::dbgs() << "mul pow op: ";
-  op->dump();
-
   auto activation = op->getAttrOfType<mlir::StringAttr>(
       "fused_activation_function").getValue();
-
-  // DEBUG
-  llvm::dbgs() << "activation: " << activation << "\n";
-
   if (activation != "NONE")
     return mlir::failure();
   auto x = op->getOperand(0).getDefiningOp();
   auto y = op->getOperand(1).getDefiningOp();
   auto xIsPow = x && mlir::isa<mlir::TFL::PowOp>(x);
   auto yIsPow = y && mlir::isa<mlir::TFL::PowOp>(y);
-
-  // DEBUG
-  llvm::dbgs() << "xIsPow: " << xIsPow << ", yIsPow: " << yIsPow << "\n";
-
   if (xIsPow || yIsPow) {
     if (xIsPow && yIsPow)
       return mlir::failure();
@@ -1265,19 +1253,10 @@ mlir::LogicalResult ReplaceMulPow::match(mlir::Operation *op) const {
     return mlir::failure();
   }
   auto pOp = y->getOperand(1).getDefiningOp();
-
-  // DEBUG
-  llvm::dbgs() << "pOp: ";
-  pOp->dump();
-
   if (!mlir::isa<mlir::arith::ConstantOp>(pOp))
     return mlir::failure();
   auto pAttr = pOp->getAttrOfType<mlir::ElementsAttr>("value");
   auto pValue = *pAttr.getValues<float>().begin();
-
-  // DEBUG
-  llvm::dbgs() << "pValue: " << pValue << "\n";
-
   if (pValue != -1)
     return mlir::failure();
   return mlir::success();
@@ -1285,7 +1264,7 @@ mlir::LogicalResult ReplaceMulPow::match(mlir::Operation *op) const {
 
 void ReplaceMulPow::rewrite(mlir::Operation *op,
                             mlir::PatternRewriter &rewriter) const {
-  llvm::dbgs() << "INFO: ReplacePowOp is called!\n";
+  llvm::dbgs() << "INFO: ReplaceMulPow is called!\n";
 
   auto x = op->getOperand(0);
   auto y = op->getOperand(1);
@@ -1299,6 +1278,162 @@ void ReplaceMulPow::rewrite(mlir::Operation *op,
   // DEBUG
   llvm::dbgs() << "result: ";
   result.dump();
+}
+
+ReplacePowOp::ReplacePowOp(mlir::MLIRContext *ctx)
+  : mlir::OpRewritePattern<mlir::TFL::PowOp>(ctx) {}
+
+mlir::LogicalResult ReplacePowOp::matchAndRewrite(
+    mlir::TFL::PowOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: ReplacePowOp is called!\n";
+
+  auto x = op.getOperand(0);
+  auto p = op.getOperand(1);
+  auto pOp = p.getDefiningOp();
+  if (!pOp || !mlir::isa<mlir::arith::ConstantOp>(pOp))
+    return mlir::failure();
+  auto pAttr = pOp->getAttrOfType<mlir::ElementsAttr>("value");
+  auto pValue = *pAttr.getValues<float>().begin();
+  if (pValue != -0.5)
+    return mlir::failure();
+  rewriter.replaceOpWithNewOp<mlir::TFL::RsqrtOp>(
+      op, op.getResult().getType(), x);
+  return mlir::success();
+}
+
+ReplaceMirrorPadOp::ReplaceMirrorPadOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::MirrorPadOp>(ctx) {}
+
+mlir::LogicalResult ReplaceMirrorPadOp::matchAndRewrite(
+    mlir::TFL::MirrorPadOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: MirrorPadOp is called!\n";
+
+  auto x = op.getOperand(0);
+  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
+  auto xShapeVec = xType.getShape().vec();
+
+  // DEBUG
+  llvm::dbgs() << "xShapeVec: ";
+  for (auto dim : xShapeVec)
+    llvm::dbgs() << dim << " ";
+  llvm::dbgs() << "\n";
+
+  // We only support NHWC
+  if (xShapeVec.size() != 4)
+    return mlir::failure();
+  auto padding = op.getOperand(1);
+
+  // DEBUG
+  llvm::dbgs() << "padding:\n";
+  padding.dump();
+
+  auto paddingOp = padding.getDefiningOp();
+  if (!paddingOp || !mlir::isa<mlir::arith::ConstantOp>(paddingOp))
+    return mlir::failure();
+  auto paddingAttr = paddingOp->getAttrOfType<mlir::ElementsAttr>(
+      "value").getValues<int32_t>();
+
+  // DEBUG
+  llvm::dbgs() << "paddingAttr: ";
+  for (auto val : paddingAttr)
+    llvm::dbgs() << val << " ";
+  llvm::dbgs() << "\n";
+
+  // We only support padding along the H and W axis
+  if (paddingAttr[0] != 0 || paddingAttr[1] != 0 ||
+      paddingAttr[6] != 0 || paddingAttr[7] != 0)
+    return mlir::failure();
+
+  auto n = xShapeVec[0], h = xShapeVec[1], w = xShapeVec[2], c = xShapeVec[3];
+  auto leftPad = paddingAttr[4];
+  auto rightPad = paddingAttr[5];
+  auto xs = std::vector<mlir::Value>{};
+
+  // DEBUG
+  llvm::dbgs() << "leftPad (" << leftPad << "):\n";
+
+  for (auto i = leftPad; i > 0; --i) {
+    xs.push_back(StridedSlice(
+        rewriter, op.getLoc(), x, xType,
+        {n, h, 1, c},
+        {0, 0, i, 0},
+        {static_cast<int32_t>(n), static_cast<int32_t>(h), i + 1,
+         static_cast<int32_t>(c)},
+        {1, 1, 1, 1}));
+
+    // DEBUG
+    xs.back().dump();
+  }
+  xs.push_back(x);
+
+  // DEBUG
+  llvm::dbgs() << "rightPad (" << rightPad << "):\n";
+
+  for (auto i = static_cast<int32_t>(w) - 2; i >= w - rightPad - 1; --i) {
+    xs.push_back(StridedSlice(
+        rewriter, op.getLoc(), x, xType,
+        {n, h, 1, c},
+        {0, 0, i, 0},
+        {static_cast<int32_t>(n), static_cast<int32_t>(h), i + 1,
+         static_cast<int32_t>(c)},
+        {1, 1, 1, 1}));
+
+    // DEBUG
+    xs.back().dump();
+  }
+  x = Concat(rewriter, op.getLoc(), xs, 2);
+
+  // DEBUG
+  llvm::dbgs() << "Concat left and right:\n";
+  x.dump();
+
+  w += leftPad + rightPad;
+
+  auto topPad = paddingAttr[2];
+  auto bottomPad = paddingAttr[3];
+  xs = std::vector<mlir::Value>{};
+
+  // DEBUG
+  llvm::dbgs() << "topPad (" << topPad << "):\n";
+
+  for (auto i = topPad; i > 0; --i) {
+    xs.push_back(StridedSlice(
+        rewriter, op.getLoc(), x, xType,
+        {n, 1, w, c},
+        {0, i, 0, 0},
+        {static_cast<int32_t>(n), i + 1, static_cast<int32_t>(w),
+         static_cast<int32_t>(c)},
+        {1, 1, 1, 1}));
+
+    // DEBUG
+    xs.back().dump();
+  }
+  xs.push_back(x);
+
+  // DEBUG
+  llvm::dbgs() << "bottomPad (" << bottomPad << "):\n";
+
+  for (auto i = static_cast<int32_t>(h) - 2; i >= h - bottomPad - 1; --i) {
+    xs.push_back(StridedSlice(
+        rewriter, op.getLoc(), x, xType,
+        {n, 1, w, c},
+        {0, i, 0, 0},
+        {static_cast<int32_t>(n), i + 1, static_cast<int32_t>(w),
+         static_cast<int32_t>(c)},
+        {1, 1, 1, 1}));
+
+    // DEBUG
+    xs.back().dump();
+  }
+  x = Concat(rewriter, op.getLoc(), xs, 1);
+
+  // DEBUG
+  llvm::dbgs() << "Concat top and bottom:\n";
+  x.dump();
+
+  rewriter.replaceOp(op, {x});
+
+  return mlir::success();
 }
 
 #define MY_TFL_PASS
@@ -1336,6 +1471,8 @@ void AllTFLPasses::runOnOperation() {
   patterns.insert(std::make_unique<ReplaceAveragePool2DOp>(ctx));
   patterns.insert(std::make_unique<ReplaceReshapeOp>(ctx));
   patterns.insert(std::make_unique<ReplaceMulPow>(ctx));
+  patterns.insert(std::make_unique<ReplacePowOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceMirrorPadOp>(ctx));
 
   mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
 }

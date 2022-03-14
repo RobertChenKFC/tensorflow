@@ -274,6 +274,22 @@ struct ReplaceMulPow : public mlir::RewritePattern {
       mlir::Operation *op, mlir::PatternRewriter &rewriter) const override;
 };
 
+struct ReplacePowOp : public mlir::OpRewritePattern<mlir::TFL::PowOp> {
+  explicit ReplacePowOp(mlir::MLIRContext *ctx);
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::TFL::PowOp op, mlir::PatternRewriter &rewriter) const override;
+};
+
+struct ReplaceMirrorPadOp : public mlir::OpRewritePattern<
+    mlir::TFL::MirrorPadOp> {
+  explicit ReplaceMirrorPadOp(mlir::MLIRContext *ctx);
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::TFL::MirrorPadOp op,
+      mlir::PatternRewriter &rewriter) const override;
+};
+
 struct AllTFLPasses : public mlir::PassWrapper<AllTFLPasses,
     mlir::OperationPass<>> {
   void runOnOperation() override;
