@@ -1436,6 +1436,20 @@ mlir::LogicalResult ReplaceMirrorPadOp::matchAndRewrite(
   return mlir::success();
 }
 
+ReplaceSquareOp::ReplaceSquareOp(mlir::MLIRContext *ctx)
+    : mlir::OpRewritePattern<mlir::TFL::SquareOp>(ctx) {}
+
+mlir::LogicalResult ReplaceSquareOp::matchAndRewrite(
+    mlir::TFL::SquareOp op, mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: SquareOp is called!\n";
+
+  auto x = op.getOperand();
+  rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(
+      op, op.getResult().getType(), x, x, "NONE");
+
+  return mlir::success();
+}
+
 #define MY_TFL_PASS
 void AllTFLPasses::runOnOperation() {
   auto ctx = &getContext();
@@ -1473,6 +1487,7 @@ void AllTFLPasses::runOnOperation() {
   patterns.insert(std::make_unique<ReplaceMulPow>(ctx));
   patterns.insert(std::make_unique<ReplacePowOp>(ctx));
   patterns.insert(std::make_unique<ReplaceMirrorPadOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceSquareOp>(ctx));
 
   mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
 }

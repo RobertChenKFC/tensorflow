@@ -290,6 +290,13 @@ struct ReplaceMirrorPadOp : public mlir::OpRewritePattern<
       mlir::PatternRewriter &rewriter) const override;
 };
 
+struct ReplaceSquareOp : public mlir::OpRewritePattern<mlir::TFL::SquareOp> {
+  explicit ReplaceSquareOp(mlir::MLIRContext *ctx);
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::TFL::SquareOp op, mlir::PatternRewriter &rewriter) const override;
+};
+
 struct AllTFLPasses : public mlir::PassWrapper<AllTFLPasses,
     mlir::OperationPass<>> {
   void runOnOperation() override;
