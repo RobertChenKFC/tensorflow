@@ -297,6 +297,16 @@ struct ReplaceSquareOp : public mlir::OpRewritePattern<mlir::TFL::SquareOp> {
       mlir::TFL::SquareOp op, mlir::PatternRewriter &rewriter) const override;
 };
 
+struct ReplaceSoftplusTanhMul : public mlir::RewritePattern {
+  explicit ReplaceSoftplusTanhMul(mlir::MLIRContext *ctx,
+                                  mlir::PatternBenefit benefit = 1);
+
+  mlir::LogicalResult match(mlir::Operation *op) const override;
+
+  void rewrite(
+      mlir::Operation *op, mlir::PatternRewriter &rewriter) const override;
+};
+
 struct AllTFLPasses : public mlir::PassWrapper<AllTFLPasses,
     mlir::OperationPass<>> {
   void runOnOperation() override;

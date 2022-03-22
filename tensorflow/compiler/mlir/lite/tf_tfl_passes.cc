@@ -852,27 +852,69 @@ mlir::LogicalResult ReplaceResizeNearestNeighbor::matchAndRewrite(
     mlir::TFL::ResizeNearestNeighborOp op, mlir::PatternRewriter &rewriter) const {
   llvm::dbgs() << "INFO: ResizeNearestNeighbor is called!\n";
 
-  // Originally, I thought that this operation couldn't be mapped because
-  // its tensor size was too big (similar to ResizeBilinear), but it turns
-  // out that this operation is unsupported if the tensor is scaled up.
   auto x = op.getOperand(0);
   auto xShape = x.getType().dyn_cast<mlir::ShapedType>().getShape();
   auto resultType = op.getResult().getType().dyn_cast<mlir::ShapedType>();
   auto resultShape = resultType.getShape();
-  auto xSize = 1;
-  for (auto dim : xShape) xSize *= dim;
-  auto resultSize = 1;
-  for (auto dim : resultShape) resultSize *= dim;
-  if (resultSize > xSize) {
-    // There is no obvious way to directly implement this operation using
-    // others, so we just replace it with ResizeBilinear.
-    rewriter.replaceOpWithNewOp<mlir::TFL::ResizeBilinearOp>(
-        op, resultType, x, op.getOperand(1),
+  auto xSize = 1, resultSize = 1;
+  bool nonIntegerMultiple = false;
+  auto nearestIntegerMultiple = 0;
+  for (auto i = 0; i < 4; ++i){
+    auto xDim = static_cast<int32_t>(xShape[i]);
+    auto resultDim = static_cast<int32_t>(resultShape[i]);
+    xSize *= xDim;
+    resultSize *= resultDim;
+    auto remainder = resultDim % xDim;
+    nonIntegerMultiple = nonIntegerMultiple || remainder != 0;
+    nearestIntegerMultiple = std::max(
+        nearestIntegerMultiple,
+        remainder == 0 ? resultDim / xDim : resultDim / xDim + 1);
+  }
+
+  // DEBUG
+  llvm::dbgs() << "xSize: " << xSize << ", resultSize: " << resultSize
+               << ", nonIntegerMultiple: " << nonIntegerMultiple
+               << ", nearestIntegerMultiple: " << nearestIntegerMultiple
+               << "\n";
+
+  if (resultSize > xSize && nonIntegerMultiple) {
+    // Originally, I thought that this operation couldn't be mapped because
+    // its tensor size was too big (similar to ResizeBilinear), but it turns
+    // out that this operation is unsupported when scaling up by non-integer
+    // multiples. Therefore, we scale up by the nearest integer multiple, and
+    // then scale down.
+    auto upsampledSizeVec = std::vector<int32_t>{
+      static_cast<int32_t>(xShape[1]) * nearestIntegerMultiple,
+      static_cast<int32_t>(xShape[2]) * nearestIntegerMultiple
+    };
+    auto upsampledSizeAttr = rewriter.getI32TensorAttr(
+        upsampledSizeVec);
+    auto upsampledSize = rewriter.create<mlir::TFL::ConstOp>(
+        op.getLoc(), upsampledSizeAttr.getType(), upsampledSizeAttr);
+    auto upsampledShape = std::vector<int64_t>{
+      xShape[0], xShape[1] * nearestIntegerMultiple,
+      xShape[2] * nearestIntegerMultiple, xShape[3]
+    };
+    auto upsampledType = resultType.clone(upsampledShape);
+    auto upsampled = rewriter.create<mlir::TFL::ResizeNearestNeighborOp>(
+        op.getLoc(), upsampledType, x, upsampledSize,
         op->getAttrOfType<mlir::BoolAttr>("align_corners"),
         op->getAttrOfType<mlir::BoolAttr>("half_pixel_centers"));
+    rewriter.replaceOpWithNewOp<mlir::TFL::ResizeNearestNeighborOp>(
+        op, resultType, upsampled, op.getOperand(1),
+        op->getAttrOfType<mlir::BoolAttr>("align_corners"),
+        op->getAttrOfType<mlir::BoolAttr>("half_pixel_centers"));
+
     return mlir::success();
+  } else {
+    // GLADNet 240x320
+    auto result = ResizePass<mlir::TFL::ResizeNearestNeighborOp>(
+        rewriter, op, {1, 96, 96, 64}, {1, 384, 384, 64}, {1, 1, 1, 4});
+    if (result.succeeded())
+      return result;
+    return ResizePass<mlir::TFL::ResizeNearestNeighborOp>(
+        rewriter, op, {1, 384, 384, 64}, {1, 240, 320, 64}, {1, 1, 2, 2});
   }
-  return mlir::failure();
 }
 
 ReplaceResizeBilinear::ReplaceResizeBilinear(mlir::MLIRContext *ctx)
@@ -891,12 +933,7 @@ mlir::LogicalResult ReplaceResizeBilinear::matchAndRewrite(
   // U^2 Net 256x256
   result = ResizePass<mlir::TFL::ResizeBilinearOp>(
       rewriter, op, {1, 128, 128, 64}, {1, 256, 256, 64}, {1, 1, 1, 4});
-  if (result.succeeded())
-    return result;
-
-  // GLADNet
-  return ResizePass<mlir::TFL::ResizeBilinearOp>(
-      rewriter, op, {1, 96, 96, 64}, {1, 180, 320, 64}, {1, 2, 2, 1});
+  return result;
 }
 
 ReplaceHardSwishOp::ReplaceHardSwishOp(mlir::MLIRContext *ctx)
@@ -1444,10 +1481,102 @@ mlir::LogicalResult ReplaceSquareOp::matchAndRewrite(
   llvm::dbgs() << "INFO: SquareOp is called!\n";
 
   auto x = op.getOperand();
-  rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(
-      op, op.getResult().getType(), x, x, "NONE");
+  auto zero = ScalarConst(rewriter, op.getLoc(), 0);
+  rewriter.replaceOpWithNewOp<mlir::TFL::SquaredDifferenceOp>(
+      op, op.getResult().getType(), x, zero);
 
   return mlir::success();
+}
+
+ReplaceSoftplusTanhMul::ReplaceSoftplusTanhMul(mlir::MLIRContext *ctx,
+                                               mlir::PatternBenefit benefit)
+    : mlir::RewritePattern(mlir::TFL::MulOp::getOperationName(),
+                           benefit, ctx) {}
+
+mlir::LogicalResult ReplaceSoftplusTanhMul::match(mlir::Operation *op) const {
+  auto activation = op->getAttrOfType<mlir::StringAttr>(
+      "fused_activation_function");
+  if (activation != "NONE")
+    return mlir::failure();
+  auto tanhOp = op->getOperand(1).getDefiningOp();
+  if (!tanhOp || !mlir::isa<mlir::TFL::TanhOp>(tanhOp))
+    return mlir::failure();
+  auto conv2DOp = op->getOperand(0).getDefiningOp();
+  if (!conv2DOp || !mlir::isa<mlir::TFL::Conv2DOp>(conv2DOp))
+    return mlir::failure();
+  activation = conv2DOp->getAttrOfType<mlir::StringAttr>(
+      "fused_activation_function");
+  if (activation != "NONE")
+    return mlir::failure();
+  auto logOp = tanhOp->getOperand(0).getDefiningOp();
+  if (!logOp || !mlir::isa<mlir::TFL::LogOp>(logOp))
+    return mlir::failure();
+  auto addOp = logOp->getOperand(0).getDefiningOp();
+  if (!addOp || !mlir::isa<mlir::TFL::AddOp>(addOp))
+    return mlir::failure();
+  activation = addOp->getAttrOfType<mlir::StringAttr>(
+      "fused_activation_function");
+  if (activation != "NONE")
+    return mlir::failure();
+  auto oneOp = addOp->getOperand(1).getDefiningOp();
+  if (!oneOp || !mlir::isa<mlir::arith::ConstantOp>(oneOp))
+    return mlir::failure();
+  auto oneAttr = oneOp->getAttrOfType<mlir::ElementsAttr>("value");
+  auto one = *oneAttr.getValues<float>().begin();
+  if (one != 1)
+    return mlir::failure();
+  auto expOp = addOp->getOperand(0).getDefiningOp();
+  if (!expOp || !mlir::isa<mlir::TFL::ExpOp>(expOp))
+    return mlir::failure();
+  auto otherConv2DOp = expOp->getOperand(0).getDefiningOp();
+  if (otherConv2DOp != conv2DOp)
+    return mlir::failure();
+  return mlir::success();
+}
+
+#define SOFTPLUS_TANH_MUL_SIGMOID
+void ReplaceSoftplusTanhMul::rewrite(mlir::Operation *op,
+                                     mlir::PatternRewriter &rewriter) const {
+  llvm::dbgs() << "INFO: SoftplusTanhMul is called!\n";
+#ifdef SOFTPLUS_TANH_MUL_RELU
+  auto conv2DOp = op->getOperand(0).getDefiningOp();
+  rewriter.replaceOpWithNewOp<mlir::TFL::Conv2DOp>(
+      op, conv2DOp->getResult(0).getType(), conv2DOp->getOperand(0),
+      conv2DOp->getOperand(1), conv2DOp->getOperand(2),
+      conv2DOp->getAttrOfType<mlir::IntegerAttr>("dilation_h_factor"),
+      conv2DOp->getAttrOfType<mlir::IntegerAttr>("dilation_w_factor"),
+      rewriter.getStringAttr("RELU"),
+      conv2DOp->getAttrOfType<mlir::StringAttr>("padding"),
+      conv2DOp->getAttrOfType<mlir::IntegerAttr>("stride_h"),
+      conv2DOp->getAttrOfType<mlir::IntegerAttr>("stride_w"));
+#elif defined(SOFTPLUS_TANH_MUL_SIGMOID)
+  auto x = op->getOperand(0);
+  auto xType = x.getType();
+  auto scale = ScalarConst(rewriter, op->getLoc(), 1.3);
+  auto offset = ScalarConst(rewriter, op->getLoc(), 0.311896);
+  auto offsetX = rewriter.create<mlir::TFL::AddOp>(
+      op->getLoc(), xType, x, offset, "NONE");
+  auto scaledX = rewriter.create<mlir::TFL::MulOp>(
+      op->getLoc(), xType, scale, offsetX, "NONE");
+  auto sigmoidX = rewriter.create<mlir::TFL::LogisticOp>(
+      op->getLoc(), xType, scaledX);
+  // Multiplication doesn't seem to work well, thus we use squared difference
+  // instead.
+  // rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(op, xType, x, sigmoidX,
+  //                                               "NONE");
+  auto xSq = rewriter.create<mlir::TFL::SquareOp>(op->getLoc(), xType, x);
+  auto sigmoidXSq = rewriter.create<mlir::TFL::SquareOp>(
+      op->getLoc(), xType, sigmoidX);
+  auto squareSum = rewriter.create<mlir::TFL::AddOp>(
+      op->getLoc(), xType, xSq, sigmoidXSq, "NONE");
+  auto squaredDiff = rewriter.create<mlir::TFL::SquaredDifferenceOp>(
+      op->getLoc(), xType, x, sigmoidX);
+  auto twiceResult = rewriter.create<mlir::TFL::SubOp>(
+      op->getLoc(), xType, squareSum, squaredDiff, "NONE");
+  auto half = ScalarConst(rewriter, op->getLoc(), 0.5);
+  rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(
+      op, xType, half, twiceResult, "NONE");
+#endif
 }
 
 #define MY_TFL_PASS
@@ -1488,6 +1617,7 @@ void AllTFLPasses::runOnOperation() {
   patterns.insert(std::make_unique<ReplacePowOp>(ctx));
   patterns.insert(std::make_unique<ReplaceMirrorPadOp>(ctx));
   patterns.insert(std::make_unique<ReplaceSquareOp>(ctx));
+  patterns.insert(std::make_unique<ReplaceSoftplusTanhMul>(ctx));
 
   mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
 }
@@ -1662,8 +1792,10 @@ AllTFPasses::AllTFPasses(const std::string &savedModelPath)
 void AllTFPasses::runOnOperation() {
   auto ctx = &getContext();
   mlir::RewritePatternSet patterns(ctx);
-  patterns.insert(std::make_unique<ReplaceSoftplusOp>(
-      ctx, savedModelPath_));
+  // DEBUG
+//  patterns.insert(std::make_unique<ReplaceSoftplusOp>(
+//      ctx, savedModelPath_));
+  patterns.insert(std::make_unique<ReplaceSoftplusTanhMul>(ctx));
 #ifdef UNPACK_TF
   patterns.insert(std::make_unique<ReplaceTFUnpackOp>(ctx));
 #endif
