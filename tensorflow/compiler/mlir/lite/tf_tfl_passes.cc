@@ -116,7 +116,6 @@ mlir::LogicalResult ReplaceAbsOp::matchAndRewrite(
 ReplaceLeakyReluOp::ReplaceLeakyReluOp(mlir::MLIRContext *ctx)
     : mlir::OpRewritePattern<mlir::TFL::LeakyReluOp>(ctx, /*benefit=*/1) {}
 
-#define LEAKY_RELU_PRELU
 mlir::LogicalResult ReplaceLeakyReluOp::matchAndRewrite(
     mlir::TFL::LeakyReluOp op,
     mlir::PatternRewriter &rewriter) const {
@@ -215,7 +214,6 @@ mlir::LogicalResult ReplaceTileOp::matchAndRewrite(
   return mlir::success();
 }
 
-#define UNPACK_TFL
 ReplaceTFLUnpackOp::ReplaceTFLUnpackOp(mlir::MLIRContext *ctx)
     : mlir::OpRewritePattern<mlir::TFL::UnpackOp>(ctx, /*benefit=*/1) {}
 
@@ -277,8 +275,7 @@ mlir::LogicalResult ReplaceTFLUnpackOp::matchAndRewrite(
   return mlir::success();
 }
 
-#define EXP_DISABLE
-#define EXP_LEAST_SQ
+#ifndef EXP_DISABLE
 ReplaceExpOp::ReplaceExpOp(mlir::MLIRContext *ctx)
     : mlir::OpRewritePattern<mlir::TFL::ExpOp>(ctx, /*benefit=*/1) {}
 
@@ -309,9 +306,9 @@ mlir::LogicalResult ReplaceExpOp::matchAndRewrite(
 
   return mlir::success();
 }
+#endif
 
-#define LOG_DISABLE
-#define LOG_LEAST_SQ
+#ifndef LOG_DISABLE
 ReplaceLogOp::ReplaceLogOp(mlir::MLIRContext *ctx)
     : mlir::OpRewritePattern<mlir::TFL::LogOp>(ctx, /*benefit=*/1) {}
 
@@ -343,6 +340,7 @@ mlir::LogicalResult ReplaceLogOp::matchAndRewrite(
 
   return mlir::success();
 }
+#endif
 
 ReplaceFullyConnectedOp::ReplaceFullyConnectedOp(mlir::MLIRContext *ctx)
     : mlir::OpRewritePattern<mlir::TFL::FullyConnectedOp>(ctx, /*benefit=*/1) {}
@@ -633,7 +631,6 @@ mlir::LogicalResult ReplaceSplitOp::matchAndRewrite(
 ReplaceMeanOp::ReplaceMeanOp(mlir::MLIRContext *ctx)
     : mlir::OpRewritePattern<mlir::TFL::MeanOp>(ctx, /*benefit=*/1) {}
 
-#define MEAN_ONE_AXIS
 mlir::LogicalResult ReplaceMeanOp::matchAndRewrite(
     mlir::TFL::MeanOp op, mlir::PatternRewriter &rewriter) const {
   llvm::dbgs() << "INFO: MeanOp is called!\n";
@@ -1481,9 +1478,8 @@ mlir::LogicalResult ReplaceSquareOp::matchAndRewrite(
   llvm::dbgs() << "INFO: SquareOp is called!\n";
 
   auto x = op.getOperand();
-  auto zero = ScalarConst(rewriter, op.getLoc(), 0);
-  rewriter.replaceOpWithNewOp<mlir::TFL::SquaredDifferenceOp>(
-      op, op.getResult().getType(), x, zero);
+  rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(
+      op, op.getResult().getType(), x, x, "NONE");
 
   return mlir::success();
 }
@@ -1534,7 +1530,6 @@ mlir::LogicalResult ReplaceSoftplusTanhMul::match(mlir::Operation *op) const {
   return mlir::success();
 }
 
-#define SOFTPLUS_TANH_MUL_SIGMOID
 void ReplaceSoftplusTanhMul::rewrite(mlir::Operation *op,
                                      mlir::PatternRewriter &rewriter) const {
   llvm::dbgs() << "INFO: SoftplusTanhMul is called!\n";
@@ -1549,7 +1544,8 @@ void ReplaceSoftplusTanhMul::rewrite(mlir::Operation *op,
       conv2DOp->getAttrOfType<mlir::StringAttr>("padding"),
       conv2DOp->getAttrOfType<mlir::IntegerAttr>("stride_h"),
       conv2DOp->getAttrOfType<mlir::IntegerAttr>("stride_w"));
-#elif defined(SOFTPLUS_TANH_MUL_SIGMOID)
+#elif defined(SOFTPLUS_TANH_MUL_SIGMOID_MUL) || \
+      defined(SOFTPLUS_TANH_MUL_SIGMOID_NO_MUL)
   auto x = op->getOperand(0);
   auto xType = x.getType();
   auto scale = ScalarConst(rewriter, op->getLoc(), 1.3);
@@ -1560,10 +1556,10 @@ void ReplaceSoftplusTanhMul::rewrite(mlir::Operation *op,
       op->getLoc(), xType, scale, offsetX, "NONE");
   auto sigmoidX = rewriter.create<mlir::TFL::LogisticOp>(
       op->getLoc(), xType, scaledX);
-  // Multiplication doesn't seem to work well, thus we use squared difference
-  // instead.
-  // rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(op, xType, x, sigmoidX,
-  //                                               "NONE");
+#ifdef SOFTPLUS_TANH_MUL_SIGMOID_MUL
+  rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(op, xType, x, sigmoidX,
+                                                "NONE");
+#else
   auto xSq = rewriter.create<mlir::TFL::SquareOp>(op->getLoc(), xType, x);
   auto sigmoidXSq = rewriter.create<mlir::TFL::SquareOp>(
       op->getLoc(), xType, sigmoidX);
@@ -1577,9 +1573,9 @@ void ReplaceSoftplusTanhMul::rewrite(mlir::Operation *op,
   rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(
       op, xType, half, twiceResult, "NONE");
 #endif
+#endif
 }
 
-#define MY_TFL_PASS
 void AllTFLPasses::runOnOperation() {
   auto ctx = &getContext();
   mlir::RewritePatternSet patterns(ctx);
@@ -1603,10 +1599,8 @@ void AllTFLPasses::runOnOperation() {
 #endif
   patterns.insert(std::make_unique<ReplaceNegOp>(ctx));
   patterns.insert(std::make_unique<ReplaceResizeNearestNeighbor>(ctx));
-  // DEBUG
   patterns.insert(std::make_unique<ReplaceResizeBilinear>(ctx));
   patterns.insert(std::make_unique<ReplaceHardSwishOp>(ctx));
-  // DEBUG
   patterns.insert(std::make_unique<ReplaceDivOp>(ctx));
   patterns.insert(std::make_unique<ReplaceSumOp>(ctx));
   patterns.insert(std::make_unique<ReplaceExpSum>(ctx));
@@ -1617,12 +1611,15 @@ void AllTFLPasses::runOnOperation() {
   patterns.insert(std::make_unique<ReplacePowOp>(ctx));
   patterns.insert(std::make_unique<ReplaceMirrorPadOp>(ctx));
   patterns.insert(std::make_unique<ReplaceSquareOp>(ctx));
+#if defined(SOFTPLUS_TANH_MUL_RELU) || \
+    defined(SOFTPLUS_TANH_MUL_SIGMOID_MUL) || \
+    defined(SOFTPLUS_TANH_MUL_SIGMOID_NO_MUL)
   patterns.insert(std::make_unique<ReplaceSoftplusTanhMul>(ctx));
+#endif
 
   mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
 }
 
-#define SOFTPLUS_RELU
 ReplaceSoftplusOp::ReplaceSoftplusOp(mlir::MLIRContext *ctx,
                                      const std::string &savedModelPath)
     : mlir::OpRewritePattern<mlir::TF::SoftplusOp>(ctx, /*benefit=*/1),
@@ -1792,22 +1789,17 @@ AllTFPasses::AllTFPasses(const std::string &savedModelPath)
 void AllTFPasses::runOnOperation() {
   auto ctx = &getContext();
   mlir::RewritePatternSet patterns(ctx);
-  // DEBUG
-//  patterns.insert(std::make_unique<ReplaceSoftplusOp>(
-//      ctx, savedModelPath_));
+#if defined(SOFTPLUS_RELU) || defined(SOFTPLUS_X) || \
+    defined(SOFTPLUS_LINE_SEGMENTS) || defined(SOFTPLUS_LEAST_SQ) || \
+    defined(SOFTPLUS_REL_LEAST_SQ) || defined(SOFTPLUS_MINIMAX) ||   \
+    defined(SOFTPLUS_TAYLOR)
+  patterns.insert(std::make_unique<ReplaceSoftplusOp>(
+      ctx, savedModelPath_));
+#endif
   patterns.insert(std::make_unique<ReplaceSoftplusTanhMul>(ctx));
 #ifdef UNPACK_TF
   patterns.insert(std::make_unique<ReplaceTFUnpackOp>(ctx));
 #endif
-
-  // DEBUG
-  // Seems like this pass isn't enabled, which means dilated convolutions are
-  // converted into SpaceToBatchND -> Conv2D -> BatchToSpaceND, creating
-  // unsupported operations. Enabling this pass replaces it back with the
-  // original dilated convolution.
-  // patterns.insert(std::make_unique<mlir::TFL::ConvertTFDilatedConvOp<
-  //     mlir::TF::Conv2DOp>>(ctx));
-
   mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
 }
 

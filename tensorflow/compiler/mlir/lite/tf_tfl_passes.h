@@ -77,6 +77,61 @@ void AddDynamicRangeQuantizationPasses(
 }  // namespace tensorflow
 
 namespace MyPass {
+
+// Some passes have multiple methods of replacing the operations, so we use
+// preprocessor flags to select between them. Only one of them should be
+// selected for each pass. This area is dedicated to place these flags
+// together so that it is easier to see if only one is selected.
+// ============================================================================
+// Leaky ReLU
+#define LEAKY_RELU_PRELU
+//#define LEAKY_RELU_X_ALPHAX
+//#define LEAKY_RELU_POS_NEG
+
+// Unpack
+#define UNPACK_TFL
+//#define UNPACK_TF
+
+// Exp
+#define EXP_DISABLE
+//#define EXP_LEAST_SQ
+//#define EXP_REL_LEAST_SQ
+//#define EXP_MINIMAX
+//#define EXP_TAYLOR
+
+// Log
+#define LOG_DISABLE
+//#define LOG_LEAST_SQ
+//#define LOG_REL_LEAST_SQ
+//#define LOG_MINIMAX
+//#define LOG_TAYLOR
+
+// Mean
+#define MEAN_ONE_AXIS
+//#define MEAN_SUM_DIV
+//#define MEAN_SUM_DIV_REPEAT
+//#define MEAN_RESHAPE
+
+// Softplus
+//#define SOFTPLUS_TANH_MUL_RELU
+//#define SOFTPLUS_TANH_MUL_SIGMOID_MUL
+//#define SOFTPLUS_TANH_MUL_SIGMOID_NO_MUL
+#define SOFTPLUS_RELU
+//#define SOFTPLUS_X
+//#define SOFTPLUS_LINE_SEGMENTS
+//#define SOFTPLUS_LEAST_SQ
+//#define SOFTPLUS_REL_LEAST_SQ
+//#define SOFTPLUS_MINIMAX
+//#define SOFTPLUS_TAYLOR
+
+// All TensorFlow Lite passes
+#define MY_TFL_PASS
+
+// All TensorFlow passes
+#define MY_TF_PASS
+
+// ============================================================================
+
 class CalibrationData {
 private:
   constexpr static const char *coeffCalculatorPath_ =
@@ -126,19 +181,23 @@ struct ReplaceTFLUnpackOp : public mlir::OpRewritePattern<mlir::TFL::UnpackOp> {
       mlir::TFL::UnpackOp op, mlir::PatternRewriter &rewriter) const override;
 };
 
+#ifndef EXP_DISABLE
 struct ReplaceExpOp : public mlir::OpRewritePattern<mlir::TFL::ExpOp> {
   explicit ReplaceExpOp(mlir::MLIRContext *ctx);
 
   mlir::LogicalResult matchAndRewrite(
       mlir::TFL::ExpOp op, mlir::PatternRewriter &rewriter) const override;
 };
+#endif
 
+#ifndef LOG_DISABLE
 struct ReplaceLogOp : public mlir::OpRewritePattern<mlir::TFL::LogOp> {
   explicit ReplaceLogOp(mlir::MLIRContext *ctx);
 
   mlir::LogicalResult matchAndRewrite(
       mlir::TFL::LogOp op, mlir::PatternRewriter &rewriter) const override;
 };
+#endif
 
 struct ReplaceFullyConnectedOp : public mlir::OpRewritePattern<
     mlir::TFL::FullyConnectedOp> {
