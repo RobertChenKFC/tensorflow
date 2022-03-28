@@ -116,7 +116,8 @@ namespace MyPass {
 //#define SOFTPLUS_TANH_MUL_RELU
 //#define SOFTPLUS_TANH_MUL_SIGMOID_MUL
 //#define SOFTPLUS_TANH_MUL_SIGMOID_NO_MUL
-#define SOFTPLUS_RELU
+#define SOFTPLUS_TANH_MUL_LINE_SEGMENTS
+//#define SOFTPLUS_RELU
 //#define SOFTPLUS_X
 //#define SOFTPLUS_LINE_SEGMENTS
 //#define SOFTPLUS_LEAST_SQ
@@ -133,22 +134,18 @@ namespace MyPass {
 // ============================================================================
 
 class CalibrationData {
-private:
-  constexpr static const char *coeffCalculatorPath_ =
-      "/home/robert/compiler-lab/edgetpu-pass/src/tools/"
-      "poly_approx_get_coeff.py";
-  std::string path_;
-  std::unordered_map<std::string, std::pair<float, float>> data_;
-
 public:
+  using Coeffs = std::tuple<
+      float, float, std::vector<float>, std::vector<float>>;
+
   explicit CalibrationData(
       const std::string &path, const std::string &filename);
 
-  std::pair<float, float> getRange(mlir::Location loc) const;
+  Coeffs getCoeffs(mlir::Location loc) const;
 
-  void getPolyCoeff(
-      mlir::Location loc, const std::string &function,
-      const std::string &method, int n, float coeffs[]) const;
+private:
+  std::string path_;
+  std::unordered_map<std::string, Coeffs> data_;
 };
 
 struct ReplaceAbsOp : public mlir::OpRewritePattern<mlir::TFL::AbsOp> {
@@ -357,27 +354,38 @@ struct ReplaceSquareOp : public mlir::OpRewritePattern<mlir::TFL::SquareOp> {
 };
 
 struct ReplaceSoftplusTanhMul : public mlir::RewritePattern {
-  explicit ReplaceSoftplusTanhMul(mlir::MLIRContext *ctx,
-                                  mlir::PatternBenefit benefit = 1);
+  explicit ReplaceSoftplusTanhMul(
+      mlir::MLIRContext *ctx, const std::string &savedModelPath,
+      mlir::PatternBenefit benefit = 1);
 
   mlir::LogicalResult match(mlir::Operation *op) const override;
 
   void rewrite(
       mlir::Operation *op, mlir::PatternRewriter &rewriter) const override;
+
+private:
+  CalibrationData calibrationData_;
 };
 
 struct AllTFLPasses : public mlir::PassWrapper<AllTFLPasses,
     mlir::OperationPass<>> {
+public:
+  explicit AllTFLPasses(const std::string &savedModelPath);
+
+private:
+  std::string savedModelPath_;
+
   void runOnOperation() override;
 };
 
 struct ReplaceSoftplusOp : public mlir::OpRewritePattern<mlir::TF::SoftplusOp> {
-  CalibrationData calibrationData_;
-
   ReplaceSoftplusOp(mlir::MLIRContext *ctx, const std::string &savedModelPath);
 
   mlir::LogicalResult matchAndRewrite(
       mlir::TF::SoftplusOp op, mlir::PatternRewriter &rewriter) const override;
+
+private:
+  CalibrationData calibrationData_;
 };
 
 struct ReplaceTFUnpackOp : public mlir::OpRewritePattern<mlir::TF::UnpackOp> {
@@ -582,10 +590,14 @@ mlir::LogicalResult ResizePass(mlir::PatternRewriter &rewriter, ResizeOp op,
   return mlir::success();
 }
 
-void AddMyTFPass(
-    llvm::StringRef modelDir, mlir::OpPassManager *passManager);
+mlir::Value PiecewiseRegression(
+    mlir::PatternRewriter &rewriter, const mlir::Location &loc,
+    const mlir::Value &x, const CalibrationData::Coeffs &coeffs);
 
-void AddMyTFLPass(mlir::OpPassManager *passManager);
+
+void AddMyTFPass(llvm::StringRef modelDir, mlir::OpPassManager *passManager);
+
+void AddMyTFLPass(llvm::StringRef modelDir, mlir::OpPassManager *passManager);
 } // namespace MyPass
 
 #endif  // TENSORFLOW_COMPILER_MLIR_LITE_TF_TFL_PASSES_H_

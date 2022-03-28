@@ -34,7 +34,7 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/tensorflow/ir/tf_saved_model.h"
 #include "tensorflow/compiler/mlir/tensorflow/transforms/passes.h"
 #include "tensorflow/compiler/mlir/tensorflow/transforms/tf_saved_model_passes.h"
-#include "tensorflow/compiler/mlir/tensorflow/translate/tf_mlir_translate.h"
+#include "tensorflow/compiler/mlir/utils/name_utils.h"
 
 namespace MyPass {
 CalibrationData::CalibrationData(const std::string &path,
@@ -42,54 +42,70 @@ CalibrationData::CalibrationData(const std::string &path,
   std::fstream file(path + "/" + filename);
   std::string opName;
   while (file >> opName) {
-    float minVal, maxVal;
-    file >> minVal >> maxVal;
-    data_[opName] = std::make_pair(minVal, maxVal);
+    float intercept, alphaHat;
+    file >> intercept >> alphaHat;
+    std::vector<float> betaHats, breakpoints;
+    int n;
+    file >> n;
+    while (n--) {
+      float betaHat;
+      file >> betaHat;
+      betaHats.push_back(betaHat);
+    }
+    file >> n;
+    while (n--) {
+      float breakpoint;
+      file >> breakpoint;
+      breakpoints.push_back(breakpoint);
+    }
+    data_[opName] = std::make_tuple(intercept, alphaHat, betaHats, breakpoints);
   }
 }
 
-std::pair<float, float> CalibrationData::getRange(mlir::Location loc) const {
-  mlir::NameLoc nameLoc;
-  while (!(nameLoc = loc.dyn_cast<mlir::NameLoc>())) {
+CalibrationData::Coeffs CalibrationData::getCoeffs(mlir::Location loc) const {
+  auto FusedLocToName = [](mlir::FusedLoc fusedLoc) {
+    auto nameLoc = fusedLoc.getLocations()[1].dyn_cast<mlir::NameLoc>();
+    auto name = nameLoc.getName().str();
+    auto pos = name.find_first_of('@');
+    if (pos != std::string::npos)
+      name = name.substr(0, pos);
+    return name;
+  };
+
+  mlir::FusedLoc fusedLoc;
+  std::string opName;
+  auto i = 0;
+  while (!(fusedLoc = loc.dyn_cast<mlir::FusedLoc>())) {
     mlir::CallSiteLoc callSiteLoc;
-    if (callSiteLoc = loc.dyn_cast<mlir::CallSiteLoc>())
+    if (callSiteLoc = loc.dyn_cast<mlir::CallSiteLoc>()) {
       loc = callSiteLoc.getCallee();
-    else
-      return std::make_pair(FLT_MIN, FLT_MAX);
+    } else {
+      llvm::errs() << "ERROR: location name not found for " << loc << "\n";
+      throw std::runtime_error("Location name not found");
+    }
+    auto fusedLoc = callSiteLoc.getCaller().dyn_cast<mlir::FusedLoc>();
+    auto name = FusedLocToName(fusedLoc);
+    if (i > 0) {
+      if (i == 1)
+        opName = name;
+      else
+        opName += "/" + name;
+    }
+    ++i;
   }
-  auto locName = nameLoc.getName().getValue().str();
-  auto opName = locName.substr(
-      0, locName.find_first_of('@')) + ":0";
+  auto name = FusedLocToName(fusedLoc);
+  if (i == 1)
+    opName = name;
+  else
+    opName += "/" + name;
 
   auto it = data_.find(opName);
-  if (it == data_.end())
-    return std::make_pair(FLT_MIN, FLT_MAX);
+  if (it == data_.end()) {
+    llvm::errs() << "ERROR: approximation data not found for "
+                 << opName << "\n";
+    throw std::runtime_error("Approximation data not found");
+  }
   return it->second;
-}
-
-void CalibrationData::getPolyCoeff(
-    mlir::Location loc, const std::string &function, const std::string &method,
-    int n, float coeffs[]) const {
-  auto [minVal, maxVal] = getRange(loc);
-  std::string filePath = path_ + "/" + function + "_poly.txt";
-  std::string cmd = std::string(coeffCalculatorPath_) +
-                    " " + function +
-                    " " + method +
-                    " " + std::to_string(n) +
-                    " " + std::to_string(minVal) +
-                    " " + std::to_string(maxVal) +
-                    " " + filePath;
-  std::system(cmd.c_str());
-
-  std::fstream file(filePath);
-  for (int i = 0; i <= n; ++i)
-    file >> coeffs[i];
-
-  llvm::dbgs() << "INFO: range: (" << minVal << ", " << maxVal << "), "
-               << "calibrated polynomial:";
-  for (int i = 0; i <= n; ++i)
-    llvm::dbgs() << " " << coeffs[i];
-  llvm::dbgs() << "\n";
 }
 
 ReplaceAbsOp::ReplaceAbsOp(mlir::MLIRContext *ctx)
@@ -1484,10 +1500,12 @@ mlir::LogicalResult ReplaceSquareOp::matchAndRewrite(
   return mlir::success();
 }
 
-ReplaceSoftplusTanhMul::ReplaceSoftplusTanhMul(mlir::MLIRContext *ctx,
-                                               mlir::PatternBenefit benefit)
+ReplaceSoftplusTanhMul::ReplaceSoftplusTanhMul(
+    mlir::MLIRContext *ctx, const std::string &savedModelPath,
+    mlir::PatternBenefit benefit)
     : mlir::RewritePattern(mlir::TFL::MulOp::getOperationName(),
-                           benefit, ctx) {}
+                           benefit, ctx),
+      calibrationData_(savedModelPath, "Mul_approx.txt") {}
 
 mlir::LogicalResult ReplaceSoftplusTanhMul::match(mlir::Operation *op) const {
   auto activation = op->getAttrOfType<mlir::StringAttr>(
@@ -1573,8 +1591,16 @@ void ReplaceSoftplusTanhMul::rewrite(mlir::Operation *op,
   rewriter.replaceOpWithNewOp<mlir::TFL::MulOp>(
       op, xType, half, twiceResult, "NONE");
 #endif
+#elif defined(SOFTPLUS_TANH_MUL_LINE_SEGMENTS)
+  auto x = op->getOperand(0);
+  auto coeffs = calibrationData_.getCoeffs(op->getLoc());
+  auto result = PiecewiseRegression(rewriter, op->getLoc(), x, coeffs);
+  rewriter.replaceOp(op, {result});
 #endif
 }
+
+AllTFLPasses::AllTFLPasses(const std::string &savedModelPath)
+    : savedModelPath_(savedModelPath) {}
 
 void AllTFLPasses::runOnOperation() {
   auto ctx = &getContext();
@@ -1613,8 +1639,10 @@ void AllTFLPasses::runOnOperation() {
   patterns.insert(std::make_unique<ReplaceSquareOp>(ctx));
 #if defined(SOFTPLUS_TANH_MUL_RELU) || \
     defined(SOFTPLUS_TANH_MUL_SIGMOID_MUL) || \
-    defined(SOFTPLUS_TANH_MUL_SIGMOID_NO_MUL)
-  patterns.insert(std::make_unique<ReplaceSoftplusTanhMul>(ctx));
+    defined(SOFTPLUS_TANH_MUL_SIGMOID_NO_MUL) || \
+    defined(SOFTPLUS_TANH_MUL_LINE_SEGMENTS)
+  patterns.insert(std::make_unique<ReplaceSoftplusTanhMul>(
+      ctx, savedModelPath_));
 #endif
 
   mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
@@ -1623,7 +1651,7 @@ void AllTFLPasses::runOnOperation() {
 ReplaceSoftplusOp::ReplaceSoftplusOp(mlir::MLIRContext *ctx,
                                      const std::string &savedModelPath)
     : mlir::OpRewritePattern<mlir::TF::SoftplusOp>(ctx, /*benefit=*/1),
-      calibrationData_(savedModelPath, "Softplus_calibration.txt") {}
+      calibrationData_(savedModelPath, "Softplus_approx.txt") {}
 
 mlir::LogicalResult ReplaceSoftplusOp::matchAndRewrite(
     mlir::TF::SoftplusOp op, mlir::PatternRewriter &rewriter) const {
@@ -1638,32 +1666,10 @@ mlir::LogicalResult ReplaceSoftplusOp::matchAndRewrite(
 #endif
 
 #ifdef SOFTPLUS_LINE_SEGMENTS
-  const float a = -1.7, b = 1.5, m = b / (b - a), n = 1 - m;
-
-  auto x = op.getOperand();
-  auto xType = x.getType().dyn_cast<mlir::ShapedType>();
-  // TODO: check out broadcasting
-  auto aAttr = mlir::SplatElementsAttr::get(xType, a);
-  auto aConst = rewriter.create<mlir::TF::ConstOp>(
-      op.getLoc(), aAttr.getType(), aAttr);
-  auto xSuba = rewriter.create<mlir::TF::SubOp>(op.getLoc(), x, aConst);
-  auto relu1 = rewriter.create<mlir::TF::ReluOp>(op.getLoc(), xSuba);
-  auto mAttr = mlir::SplatElementsAttr::get(xType, m);
-  auto mConst = rewriter.create<mlir::TF::ConstOp>(
-      op.getLoc(), mAttr.getType(), mAttr);
-  auto part1 = rewriter.create<mlir::TF::MulOp>(op.getLoc(), mConst, relu1);
-
-  auto bAttr = mlir::SplatElementsAttr::get(xType, b);
-  auto bConst = rewriter.create<mlir::TF::ConstOp>(
-      op.getLoc(), bAttr.getType(), bAttr);
-  auto xSubb = rewriter.create<mlir::TF::SubOp>(op.getLoc(), x, bConst);
-  auto relu2 = rewriter.create<mlir::TF::ReluOp>(op.getLoc(), xSubb);
-  auto nAttr = mlir::SplatElementsAttr::get(xType, n);
-  auto nConst = rewriter.create<mlir::TF::ConstOp>(
-      op.getLoc(), nAttr.getType(), nAttr);
-  auto part2 = rewriter.create<mlir::TF::MulOp>(op.getLoc(), nConst, relu2);
-
-  rewriter.replaceOpWithNewOp<mlir::TF::AddOp>(op, part1, part2);
+  auto coeffs = calibrationData_.getCoeffs(op.getLoc());
+  auto result = PiecewiseRegression(
+      rewriter, op.getLoc(), op.getOperand(), coeffs);
+  rewriter.replaceOp(op, {result});
 #endif
 
 #if defined(SOFTPLUS_LEAST_SQ) || defined(SOFTPLUS_REL_LEAST_SQ) || \
@@ -1796,7 +1802,6 @@ void AllTFPasses::runOnOperation() {
   patterns.insert(std::make_unique<ReplaceSoftplusOp>(
       ctx, savedModelPath_));
 #endif
-  patterns.insert(std::make_unique<ReplaceSoftplusTanhMul>(ctx));
 #ifdef UNPACK_TF
   patterns.insert(std::make_unique<ReplaceTFUnpackOp>(ctx));
 #endif
@@ -1956,19 +1961,42 @@ mlir::Value ScalarConst(
       loc, constAttr.getType(), constAttr);
 }
 
-#define MY_TF_PASS
-void AddMyTFPass(
-  llvm::StringRef modelDir, mlir::OpPassManager *passManager) {
+mlir::Value PiecewiseRegression(
+    mlir::PatternRewriter &rewriter, const mlir::Location &loc,
+    const mlir::Value &x, const CalibrationData::Coeffs &coeffs) {
+  const auto &[intercept, alphaHat, betaHats, breakpoints] = coeffs;
+  auto xType = x.getType();
+  auto alphaX = rewriter.create<mlir::TFL::MulOp>(
+      loc, xType, x, ScalarConst(rewriter, loc, alphaHat),
+      "NONE");
+  auto shiftedX = rewriter.create<mlir::TFL::AddOp>(
+      loc, xType, alphaX, ScalarConst(rewriter, loc, intercept), "NONE");
+  auto result = shiftedX.getResult();
+  auto n = betaHats.size();
+  for (auto i = 0; i < n; ++i) {
+    auto subX = rewriter.create<mlir::TFL::SubOp>(
+        loc, xType, x,
+        ScalarConst(rewriter, loc, breakpoints[i]), "RELU");
+    auto betaX = rewriter.create<mlir::TFL::MulOp>(
+        loc, xType, subX,
+        ScalarConst(rewriter, loc, betaHats[i]), "NONE");
+    result = rewriter.create<mlir::TFL::AddOp>(
+        loc, xType, result, betaX, "NONE");
+  }
+  return result;
+}
+
+void AddMyTFPass(llvm::StringRef modelDir, mlir::OpPassManager *passManager) {
 #ifdef MY_TF_PASS
   passManager->addPass(std::make_unique<MyPass::AllTFPasses>(
       modelDir.str()));
 #endif
 }
 
-#define MY_TFL_PASS
-void AddMyTFLPass(mlir::OpPassManager *passManager) {
+void AddMyTFLPass(llvm::StringRef modelDir, mlir::OpPassManager *passManager) {
 #ifdef MY_TFL_PASS
-  passManager->addPass(std::make_unique<MyPass::AllTFLPasses>());
+  passManager->addPass(
+      std::make_unique<MyPass::AllTFLPasses>(modelDir.str()));
 #endif
 }
 } // namespace MyPass
@@ -2256,7 +2284,7 @@ void AddPostVariableFreezingTFToTFLConversionPasses(
     pass_manager->addNestedPass<mlir::FuncOp>(mlir::createCanonicalizerPass());
     pass_manager->addNestedPass<mlir::FuncOp>(mlir::createCSEPass());
 
-    MyPass::AddMyTFLPass(pass_manager);
+    MyPass::AddMyTFLPass(saved_model_dir, pass_manager);
 
     // Run quantization after all the floating point model conversion is
     // completed. Add either full integer quantization or dynamic range
