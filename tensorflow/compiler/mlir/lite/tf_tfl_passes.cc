@@ -1515,13 +1515,7 @@ mlir::LogicalResult ReplaceSoftplusTanhMul::match(mlir::Operation *op) const {
   auto tanhOp = op->getOperand(1).getDefiningOp();
   if (!tanhOp || !mlir::isa<mlir::TFL::TanhOp>(tanhOp))
     return mlir::failure();
-  auto conv2DOp = op->getOperand(0).getDefiningOp();
-  if (!conv2DOp || !mlir::isa<mlir::TFL::Conv2DOp>(conv2DOp))
-    return mlir::failure();
-  activation = conv2DOp->getAttrOfType<mlir::StringAttr>(
-      "fused_activation_function");
-  if (activation != "NONE")
-    return mlir::failure();
+  auto inputOp = op->getOperand(0).getDefiningOp();
   auto logOp = tanhOp->getOperand(0).getDefiningOp();
   if (!logOp || !mlir::isa<mlir::TFL::LogOp>(logOp))
     return mlir::failure();
@@ -1542,8 +1536,8 @@ mlir::LogicalResult ReplaceSoftplusTanhMul::match(mlir::Operation *op) const {
   auto expOp = addOp->getOperand(0).getDefiningOp();
   if (!expOp || !mlir::isa<mlir::TFL::ExpOp>(expOp))
     return mlir::failure();
-  auto otherConv2DOp = expOp->getOperand(0).getDefiningOp();
-  if (otherConv2DOp != conv2DOp)
+  auto otherInputOp = expOp->getOperand(0).getDefiningOp();
+  if (otherInputOp != inputOp)
     return mlir::failure();
   return mlir::success();
 }
@@ -1552,16 +1546,9 @@ void ReplaceSoftplusTanhMul::rewrite(mlir::Operation *op,
                                      mlir::PatternRewriter &rewriter) const {
   llvm::dbgs() << "INFO: SoftplusTanhMul is called!\n";
 #ifdef SOFTPLUS_TANH_MUL_RELU
-  auto conv2DOp = op->getOperand(0).getDefiningOp();
-  rewriter.replaceOpWithNewOp<mlir::TFL::Conv2DOp>(
-      op, conv2DOp->getResult(0).getType(), conv2DOp->getOperand(0),
-      conv2DOp->getOperand(1), conv2DOp->getOperand(2),
-      conv2DOp->getAttrOfType<mlir::IntegerAttr>("dilation_h_factor"),
-      conv2DOp->getAttrOfType<mlir::IntegerAttr>("dilation_w_factor"),
-      rewriter.getStringAttr("RELU"),
-      conv2DOp->getAttrOfType<mlir::StringAttr>("padding"),
-      conv2DOp->getAttrOfType<mlir::IntegerAttr>("stride_h"),
-      conv2DOp->getAttrOfType<mlir::IntegerAttr>("stride_w"));
+  auto x = op->getOperand(0);
+  rewriter.replaceOpWithNewOp<mlir::TFL::ReluOp>(
+      op, op->getResult(0).getType(), x);
 #elif defined(SOFTPLUS_TANH_MUL_SIGMOID_MUL) || \
       defined(SOFTPLUS_TANH_MUL_SIGMOID_NO_MUL)
   auto x = op->getOperand(0);
