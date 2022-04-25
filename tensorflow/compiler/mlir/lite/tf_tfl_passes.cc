@@ -946,6 +946,13 @@ mlir::LogicalResult ReplaceResizeBilinear::matchAndRewrite(
   // U^2 Net 256x256
   result = ResizePass<mlir::TFL::ResizeBilinearOp>(
       rewriter, op, {1, 128, 128, 64}, {1, 256, 256, 64}, {1, 2, 2, 1});
+  if (result.succeeded())
+    return result;
+
+  // U^2 Net Experiment
+  result = ResizePass<mlir::TFL::ResizeBilinearOp>(
+      rewriter, op, {1, 128, 128, 44}, {1, 256, 256, 44}, {1, 2, 2, 1});
+
   return result;
 }
 
